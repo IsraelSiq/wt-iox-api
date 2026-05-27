@@ -1,0 +1,11 @@
+services:
+  wt-iox-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - WT_HOST=host.docker.internal
+      - WT_PORT=8111
+      - POLL_HZ=10
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
