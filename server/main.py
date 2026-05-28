@@ -162,9 +162,23 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
 
 
 # ----------------------------------------------------------------
+# Extract player position from map_obj Player marker
+# ----------------------------------------------------------------
+def _extract_player_pos(raw_objects: list) -> tuple[float, float] | None:
+    """Return (lat, lon) of the Player marker, or None if not found."""
+    for obj in raw_objects:
+        if obj.get("icon") == "Player":
+            ox = obj.get("x", None)
+            oy = obj.get("y", None)
+            if ox is not None and oy is not None:
+                return xy_to_latlon(float(ox), float(oy))
+    return None
+
+
+# ----------------------------------------------------------------
 # WT state -> AircraftState
 # ----------------------------------------------------------------
-def _parse_state(data: dict) -> AircraftState:
+def _parse_state(data: dict, lat: float = 0.0, lon: float = 0.0) -> AircraftState:
     ias_ms  = float(data.get("IAS, km/h", 0)) / 3.6
     tas_ms  = float(data.get("TAS, km/h", 0)) / 3.6
     alt_m   = float(data.get("altitude_10", data.get("altitude", 0)))
@@ -182,6 +196,8 @@ def _parse_state(data: dict) -> AircraftState:
     return AircraftState(
         timestamp=time.time(),
         aircraft=data.get("type", "unknown"),
+        lat=lat,
+        lon=lon,
         alt_msl_m=alt_m,
         ias_ms=ias_ms,
         tas_ms=tas_ms,
@@ -233,27 +249,40 @@ async def poll_warthunder():
             t0 = time.time()
             shared.poll_count += 1
 
-            player_lat = shared.latest_state.lat if shared.latest_state else 0.0
-            player_lon = shared.latest_state.lon if shared.latest_state else 0.0
+            # --- fetch map_obj first to get player position ---
+            raw_objs: list = []
+            try:
+                async with session.get(URL_MAP_OBJ) as r:
+                    if r.status == 200:
+                        raw_objs = await r.json(content_type=None)
+            except Exception:
+                pass
 
+            # Extract player lat/lon from the Player marker in map_obj
+            player_pos = _extract_player_pos(raw_objs)
+            if player_pos:
+                player_lat, player_lon = player_pos
+            elif shared.latest_state:
+                player_lat = shared.latest_state.lat
+                player_lon = shared.latest_state.lon
+            else:
+                player_lat, player_lon = 0.0, 0.0
+
+            # --- fetch /state and inject lat/lon from map_obj ---
             try:
                 async with session.get(URL_STATE) as r:
                     if r.status == 200:
                         data = await r.json(content_type=None)
-                        shared.latest_state = _parse_state(data)
+                        shared.latest_state = _parse_state(data, lat=player_lat, lon=player_lon)
                         shared.wt_connected = True
                     else:
                         shared.wt_connected = False
             except Exception:
                 shared.wt_connected = False
 
-            try:
-                async with session.get(URL_MAP_OBJ) as r:
-                    if r.status == 200:
-                        objs = await r.json(content_type=None)
-                        _ingest_contacts(objs, player_lat, player_lon)
-            except Exception:
-                pass
+            # --- ingest contacts using confirmed player position ---
+            if raw_objs:
+                _ingest_contacts(raw_objs, player_lat, player_lon)
 
             elapsed = time.time() - t0
             await asyncio.sleep(max(0, interval - elapsed))
