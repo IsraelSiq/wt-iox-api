@@ -7,6 +7,7 @@ import math
 import os
 import time
 import datetime
+from collections import deque
 import uvicorn
 import aiohttp
 
@@ -80,15 +81,6 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 
 # ----------------------------------------------------------------
 # Icon -> Category mapping
-# Based on actual WT map_obj.json icon values observed in-game.
-# WT sends icon as a string; values are case-insensitive matched.
-#
-# Air icons  : aircraft, fighter, bomber, attacker, aviation,
-#              helicopter, heli, plane, jet
-# Ground icons: tank, car, truck, spaa, aaa, artillery,
-#               armoured, vehicle, ground
-# Naval icons : ship, destroyer, cruiser, carrier, boat, naval,
-#               frigate, submarine
 # ----------------------------------------------------------------
 _AIR_ICONS = {
     "aircraft", "fighter", "bomber", "attacker", "aviation",
@@ -105,13 +97,11 @@ _NAVAL_ICONS = {
 
 
 def _icon_to_category(icon: str) -> str:
-    """Map WT icon string to Air / Ground / Naval. Defaults to Ground."""
     key = icon.lower().strip()
     if key in _AIR_ICONS:
         return "Air"
     if key in _NAVAL_ICONS:
         return "Naval"
-    # Partial-match fallback for compound icon names (e.g. "light_tank")
     for air in _AIR_ICONS:
         if air in key:
             return "Air"
@@ -122,33 +112,57 @@ def _icon_to_category(icon: str) -> str:
 
 
 # ----------------------------------------------------------------
-# Speed estimation via position delta between polls
-# Stores last known (lat, lon, timestamp) per contact uid
+# Sliding-window speed estimator
+#
+# For each contact uid we keep a deque of the last SPEED_WINDOW
+# instantaneous speed samples (m/s). The reported speed is the
+# mean of all samples in the window, which smooths out the noise
+# caused by low map_obj.json position resolution at high poll rates.
+#
+# SPEED_WINDOW = 5  →  ~500 ms of history at 10 Hz
+#                       smoother than a single-sample delta while
+#                       still reacting to real speed changes within ~1 s
 # ----------------------------------------------------------------
-_prev_positions: dict[str, tuple[float, float, float]] = {}  # uid -> (lat, lon, ts)
+SPEED_WINDOW = 5  # number of samples to average
 
-_MIN_SPEED_KMH = 300.0  # only contacts faster than this are kept
+# uid -> deque of (speed_ms,) samples
+_speed_windows: dict[str, deque] = {}
+# uid -> (lat, lon, ts) — last known position for delta calculation
+_prev_positions: dict[str, tuple[float, float, float]] = {}
+
+_MIN_SPEED_KMH = 300.0
 
 
-def _estimate_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
-    """Return estimated ground speed in m/s using haversine delta from last poll."""
+def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
+    """
+    Compute instantaneous speed from position delta, push into the
+    sliding window for this uid, and return the windowed mean.
+    """
     prev = _prev_positions.get(uid)
     if prev is None:
         _prev_positions[uid] = (lat, lon, now)
+        # No sample yet — initialise empty window
+        _speed_windows.setdefault(uid, deque(maxlen=SPEED_WINDOW))
         return 0.0
+
     p_lat, p_lon, p_ts = prev
     dt = now - p_ts
-    if dt <= 0:
-        return 0.0
-    dist_m = haversine(p_lat, p_lon, lat, lon)
-    speed_ms = dist_m / dt
+    if dt > 0:
+        dist_m   = haversine(p_lat, p_lon, lat, lon)
+        instant  = dist_m / dt
+    else:
+        instant = 0.0
+
     _prev_positions[uid] = (lat, lon, now)
-    return speed_ms
+
+    win = _speed_windows.setdefault(uid, deque(maxlen=SPEED_WINDOW))
+    win.append(instant)
+
+    return sum(win) / len(win)
 
 
 # ----------------------------------------------------------------
-# Contacts ingestion
-# Only Air contacts moving faster than _MIN_SPEED_KMH are kept.
+# Contacts ingestion — Air only, speed > 300 km/h
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
@@ -160,7 +174,6 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             if icon in ("Player", "Waypoint"):
                 continue
 
-            # --- Air-only filter ---
             category = _icon_to_category(icon)
             if category != "Air":
                 continue
@@ -180,12 +193,10 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
 
             uid = str(obj.get("id", f"{ox:.4f}_{oy:.4f}"))
 
-            # --- Speed estimation ---
-            speed_ms  = _estimate_speed_ms(uid, lat, lon, now)
+            speed_ms  = _smoothed_speed_ms(uid, lat, lon, now)
             speed_kmh = speed_ms * 3.6
             speed_kts = speed_ms * 1.94384
 
-            # --- Speed filter: skip contacts below threshold ---
             if speed_kmh < _MIN_SPEED_KMH:
                 continue
 
@@ -207,11 +218,15 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
         except Exception as e:
             log.debug(f"[contacts] parse error: {e} | {obj}")
 
-    # Clean up stale entries from _prev_positions to avoid unbounded growth
+    # Evict stale tracking data (absent > 30 s)
     active_uids = set(new_contacts.keys())
-    stale = [k for k in _prev_positions if k not in active_uids and (now - _prev_positions[k][2]) > 30]
+    stale = [
+        k for k in _prev_positions
+        if k not in active_uids and (now - _prev_positions[k][2]) > 30
+    ]
     for k in stale:
-        del _prev_positions[k]
+        _prev_positions.pop(k, None)
+        _speed_windows.pop(k, None)
 
     shared.contacts = new_contacts
     shared.contacts_timestamp = time.time()
@@ -301,7 +316,7 @@ async def poll_warthunder():
     global _map_x_min, _map_x_max, _map_y_min, _map_y_max, _anchor_lat, _anchor_lon
 
     interval = 1.0 / POLL_HZ
-    log.info(f"[wt-iox] Polling {WT_BASE} at {POLL_HZ}Hz")
+    log.info(f"[wt-iox] Polling {WT_BASE} at {POLL_HZ}Hz  (speed window: {SPEED_WINDOW} samples)")
 
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=1.0),
@@ -332,7 +347,7 @@ async def poll_warthunder():
                 async with session.get(URL_MAP_OBJ) as r:
                     if r.status == 200:
                         raw_objs = await r.json(content_type=None)
-                        shared.raw_map_obj = raw_objs   # store for /debug/map_obj
+                        shared.raw_map_obj = raw_objs
             except Exception:
                 pass
 
