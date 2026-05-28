@@ -171,7 +171,31 @@ def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float | 
 
 
 # ----------------------------------------------------------------
+# UID stable hash — used when obj["id"] is absent
+# fix: deterministic key so the same object never duplicates across polls
+# ----------------------------------------------------------------
+def _stable_uid(obj: dict, index: int) -> str:
+    """Returns a stable string UID for a map object.
+
+    Priority:
+    1. obj["id"]  — numeric id assigned by WT (most reliable)
+    2. type+color+x+y rounded to 3 dp  — positional fingerprint (static/ground objects)
+    3. fallback to index (should never reach this)
+    """
+    obj_id = obj.get("id")
+    if obj_id is not None:
+        return str(obj_id)
+
+    obj_type  = obj.get("type", "?")
+    obj_color = obj.get("color", "?")
+    x = round(float(obj.get("x", 0)), 3)
+    y = round(float(obj.get("y", 0)), 3)
+    return f"{obj_type}_{obj_color}_{x}_{y}"
+
+
+# ----------------------------------------------------------------
 # Contacts ingestion
+# fix: only runs when wt_connected=True; clears on disconnect
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
@@ -196,13 +220,7 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
 
             dist_m = haversine(player_lat, player_lon, lat, lon) if (player_lat or player_lon) else 0.0
 
-            obj_id = obj.get("id")
-            if obj_id is not None:
-                uid = str(obj_id)
-            else:
-                obj_type  = obj.get("type", "?")
-                obj_color = obj.get("color", "?")
-                uid = f"{obj_type}_{obj_color}_{i}"
+            uid = _stable_uid(obj, i)  # fix: stable UID — no more duplicates
 
             category = _icon_to_category(icon)
 
@@ -403,6 +421,33 @@ async def poll_warthunder():
             t0 = time.time()
             shared.poll_count += 1
 
+            # --------------------------------------------------------
+            # fix: poll /state FIRST — wt_connected gates everything
+            # Only parse map objects when the game is actually running.
+            # --------------------------------------------------------
+            wt_state_data: dict | None = None
+            try:
+                async with session.get(URL_STATE) as r:
+                    if r.status == 200:
+                        wt_state_data = await r.json(content_type=None)
+                        shared.wt_connected = True
+                    else:
+                        shared.wt_connected = False
+            except Exception:
+                shared.wt_connected = False
+
+            # fix: when game is offline — clear all contacts immediately
+            if not shared.wt_connected:
+                if shared.contacts or shared.static_objects:
+                    log.info("[wt-iox] WT offline — clearing contacts and statics")
+                    shared.contacts = {}
+                    shared.static_objects = []
+                    _prev_positions.clear()
+                    _speed_windows.clear()
+                elapsed = time.time() - t0
+                await asyncio.sleep(max(0, interval - elapsed))
+                continue  # skip map polling entirely when offline
+
             # fix #7: re-fetch map_info when map_generation changes
             try:
                 async with session.get(URL_MAP_INFO) as r:
@@ -413,7 +458,6 @@ async def poll_warthunder():
                             log.info(f"[wt-iox] map_generation changed {last_generation} -> {cur_gen}, re-fetching map_info")
                             await _fetch_map_info(session)
                             last_generation = cur_gen
-                            # Clear stale tracking data on map change
                             _prev_positions.clear()
                             _speed_windows.clear()
                             shared.contacts.clear()
@@ -439,16 +483,8 @@ async def poll_warthunder():
             else:
                 player_lat, player_lon = 0.0, 0.0
 
-            try:
-                async with session.get(URL_STATE) as r:
-                    if r.status == 200:
-                        data = await r.json(content_type=None)
-                        shared.latest_state = _parse_state(data, lat=player_lat, lon=player_lon)
-                        shared.wt_connected = True
-                    else:
-                        shared.wt_connected = False
-            except Exception:
-                shared.wt_connected = False
+            if wt_state_data:
+                shared.latest_state = _parse_state(wt_state_data, lat=player_lat, lon=player_lon)
 
             if raw_objs:
                 _ingest_contacts(raw_objs, player_lat, player_lon)

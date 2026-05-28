@@ -62,16 +62,22 @@ async def broadcast_telemetry():
 
 
 async def broadcast_radar():
-    """Broadcasts combined self+contacts frame at 5 Hz to radar clients."""
+    """Broadcasts combined self+contacts frame at 5 Hz to radar clients.
+
+    fix: when WT is offline the frame carries wt_connected=False and
+    empty contacts/self so the radar UI can show a proper offline state
+    instead of freezing on the last valid frame.
+    """
     log.info("Radar WS broadcast loop started")
     while True:
         await asyncio.sleep(1 / 5)
         if not manager_radar.active:
             continue
         frame = {
-            "self":     shared.latest_state.model_dump() if shared.latest_state else None,
-            "contacts": [c.model_dump() for c in shared.contacts.values()],
-            "ts":       time.time(),
+            "wt_connected": shared.wt_connected,
+            "self":         shared.latest_state.model_dump() if (shared.wt_connected and shared.latest_state) else None,
+            "contacts":     [c.model_dump() for c in shared.contacts.values()] if shared.wt_connected else [],
+            "ts":           time.time(),
         }
         await manager_radar.broadcast(json.dumps(frame))
 
@@ -174,22 +180,14 @@ async def get_contacts():
 # ----------------------------------------------------------------
 @app.get("/map", tags=["Map"])
 async def get_map():
-    """Returns a GeoJSON FeatureCollection with own-ship + all contacts.
-
-    Each Feature carries the full contact/state payload as ``properties``.
-    Coalition values: 1 = allies, 2 = enemies, 0/None = neutral/unknown.
-    """
+    """Returns a GeoJSON FeatureCollection with own-ship + all contacts."""
     features: list[dict] = []
 
-    # Own ship
-    if shared.latest_state:
+    if shared.latest_state and shared.wt_connected:
         s = shared.latest_state
         features.append({
             "type": "Feature",
-            "geometry": {
-                "type": "Point",
-                "coordinates": [s.lon, s.lat],
-            },
+            "geometry": {"type": "Point", "coordinates": [s.lon, s.lat]},
             "properties": {
                 "id":          "self",
                 "role":        "self",
@@ -202,14 +200,10 @@ async def get_map():
             },
         })
 
-    # Contacts
     for c in shared.contacts.values():
         features.append({
             "type": "Feature",
-            "geometry": {
-                "type": "Point",
-                "coordinates": [c.lon, c.lat],
-            },
+            "geometry": {"type": "Point", "coordinates": [c.lon, c.lat]},
             "properties": {
                 "id":          c.id,
                 "role":        "contact",
@@ -225,26 +219,19 @@ async def get_map():
         })
 
     return {
-        "type":      "FeatureCollection",
-        "timestamp": time.time(),
-        "count":     len(features),
-        "features":  features,
+        "type":         "FeatureCollection",
+        "wt_connected": shared.wt_connected,
+        "timestamp":    time.time(),
+        "count":        len(features),
+        "features":     features,
     }
 
 
 # ----------------------------------------------------------------
 # fix #8 — Map image proxy
-# Proxies GET /map.img from WT localhost:8111 so browser clients
-# (served from a different port) can load the map tile without
-# running into CORS restrictions.
 # ----------------------------------------------------------------
 @app.get("/map/image", tags=["Map"])
 async def map_image():
-    """Proxies the War Thunder map image (map.img) from localhost:8111.
-
-    Returns the raw PNG/JPEG bytes with the original Content-Type.
-    Responds with 503 if WT is not reachable or returns a non-200 status.
-    """
     url = f"{shared.wt_base}/map.img"
     try:
         async with aiohttp.ClientSession(
@@ -252,38 +239,21 @@ async def map_image():
         ) as session:
             async with session.get(url) as r:
                 if r.status != 200:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"WT returned HTTP {r.status} for map.img",
-                    )
+                    raise HTTPException(status_code=503, detail=f"WT returned HTTP {r.status} for map.img")
                 content_type = r.headers.get("Content-Type", "image/jpeg")
                 data = await r.read()
                 return Response(content=data, media_type=content_type)
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Could not reach War Thunder map image: {exc}",
-        )
+        raise HTTPException(status_code=503, detail=f"Could not reach War Thunder map image: {exc}")
 
 
 # ----------------------------------------------------------------
 # fix #9 — Static map objects
-# Returns airfields, spawn points, capture zones and other objects
-# that don't move between frames (category == "Static").
-# These are separated from /contacts so radar clients don't have
-# to filter them out on every frame.
 # ----------------------------------------------------------------
 @app.get("/map/static", tags=["Map"])
 async def get_static_objects():
-    """Returns static map objects: airfields, spawn points, capture zones.
-
-    These are polled from map_obj.json but separated from dynamic contacts
-    because they don't move — clients can cache them for the duration of
-    a mission and only re-fetch when ``/map/info`` reports a new
-    ``map_generation``.
-    """
     return {
         "count":     len(shared.static_objects),
         "timestamp": shared.contacts_timestamp,
@@ -292,49 +262,29 @@ async def get_static_objects():
 
 
 # ----------------------------------------------------------------
-# Map info — exposes current map metadata (name, generation, bounds)
+# Map info
 # ----------------------------------------------------------------
 @app.get("/map/info", tags=["Map"])
 async def get_map_info():
-    """Returns current map metadata: name, generation counter, and bounds.
-
-    Clients can poll this endpoint and compare ``map_generation`` to detect
-    when the map changes, then re-fetch ``/map/image`` and ``/map/static``
-    accordingly.
-    """
     if shared.map_info is None:
         raise HTTPException(status_code=503, detail="Map info not available yet.")
     return shared.map_info
 
 
 # ----------------------------------------------------------------
-# Debug endpoint — raw category/type inspection
+# Debug endpoints
 # ----------------------------------------------------------------
 @app.get("/debug/raw_contacts", tags=["Debug"])
 async def debug_raw_contacts():
-    """Returns raw 'type' and 'category' fields for each contact.
-    Use this in-mission to see exactly what strings WT sends,
-    so the radar category filter can be tuned accordingly."""
     return [
-        {
-            "id":       c.id,
-            "name":     c.name,
-            "type":     c.type,
-            "category": c.category,
-            "coalition": c.coalition,
-        }
+        {"id": c.id, "name": c.name, "type": c.type, "category": c.category, "coalition": c.coalition}
         for c in shared.contacts.values()
     ]
 
 
 @app.get("/debug/map_obj", tags=["Debug"])
 async def debug_map_obj():
-    """Returns the raw list last received from WT /map_obj endpoint.
-    Useful for inspecting new field names or unexpected object types."""
-    return {
-        "count":   len(shared.raw_map_obj),
-        "objects": shared.raw_map_obj,
-    }
+    return {"count": len(shared.raw_map_obj), "objects": shared.raw_map_obj}
 
 
 # ----------------------------------------------------------------
