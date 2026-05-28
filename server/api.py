@@ -169,6 +169,69 @@ async def get_contacts():
 
 
 # ----------------------------------------------------------------
+# Map — GeoJSON tactical picture
+# ----------------------------------------------------------------
+@app.get("/map", tags=["Map"])
+async def get_map():
+    """Returns a GeoJSON FeatureCollection with own-ship + all contacts.
+
+    Each Feature carries the full contact/state payload as ``properties``.
+    Coalition values: 1 = allies, 2 = enemies, 0/None = neutral/unknown.
+    """
+    features: list[dict] = []
+
+    # Own ship
+    if shared.latest_state:
+        s = shared.latest_state
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [s.lon, s.lat],
+            },
+            "properties": {
+                "id":          "self",
+                "role":        "self",
+                "name":        s.aircraft or "own-ship",
+                "alt_msl_m":   s.alt_msl_m,
+                "heading_deg": s.heading_deg,
+                "speed_ms":    s.ias_ms,
+                "coalition":   None,
+                "timestamp":   s.timestamp,
+            },
+        })
+
+    # Contacts
+    for c in shared.contacts.values():
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [c.lon, c.lat],
+            },
+            "properties": {
+                "id":          c.id,
+                "role":        "contact",
+                "name":        c.name,
+                "type":        c.type,
+                "category":    c.category,
+                "coalition":   c.coalition,
+                "alt_msl_m":   c.alt_msl_m,
+                "heading_deg": c.heading_deg,
+                "speed_ms":    c.speed_ms,
+                "dist_m":      c.dist_m,
+            },
+        })
+
+    return {
+        "type":      "FeatureCollection",
+        "timestamp": time.time(),
+        "count":     len(features),
+        "features":  features,
+    }
+
+
+# ----------------------------------------------------------------
 # Debug endpoint — raw category/type inspection
 # ----------------------------------------------------------------
 @app.get("/debug/raw_contacts", tags=["Debug"])
@@ -186,6 +249,16 @@ async def debug_raw_contacts():
         }
         for c in shared.contacts.values()
     ]
+
+
+@app.get("/debug/map_obj", tags=["Debug"])
+async def debug_map_obj():
+    """Returns the raw list last received from WT /map_obj endpoint.
+    Useful for inspecting new field names or unexpected object types."""
+    return {
+        "count":   len(shared.raw_map_obj),
+        "objects": shared.raw_map_obj,
+    }
 
 
 # ----------------------------------------------------------------
@@ -731,7 +804,7 @@ function updateSidebar(){
   const list=document.getElementById('contact-list');
   if(!n){list.innerHTML='<div style="color:var(--muted);font-size:11px;padding:8px 0;text-align:center">No contacts</div>';return;}
   const sorted=[...visible].sort((a,b)=>a.dist_m-b.dist_m);
-  list.innerHTML=sorted.map(c=>{const color=iffColor(c.coalition);const dist=c.dist_m>=1000?(c.dist_m/1000).toFixed(1)+'km':Math.round(c.dist_m)+'m';const alt=Math.round(c.alt_msl_m||0);const isThreat=c.coalition===2&&c.dist_m<20000;return'<div class="contact-row'+(c.id===selectedId?' selected':'')+(isThreat?' threat':'')+'\" onclick="selectContact(\''+c.id+'\')"><div class="iff-dot" style="background:'+color+'"></div><div class="contact-name">'+(c.name||c.id)+'</div><div class="contact-dist">'+dist+'</div><div class="contact-alt">'+alt+'m</div></div>';}).join('');
+  list.innerHTML=sorted.map(c=>{const color=iffColor(c.coalition);const dist=c.dist_m>=1000?(c.dist_m/1000).toFixed(1)+'km':Math.round(c.dist_m)+'m';const alt=Math.round(c.alt_msl_m||0);const isThreat=c.coalition===2&&c.dist_m<20000;return'<div class="contact-row'+(c.id===selectedId?' selected':'')+(isThreat?' threat':'')+'" onclick="selectContact(\''+c.id+'\')"><div class="iff-dot" style="background:'+color+'"></div><div class="contact-name">'+(c.name||c.id)+'</div><div class="contact-dist">'+dist+'</div><div class="contact-alt">'+alt+'m</div></div>';}).join('');
 }
 function selectContact(id){
   selectedId=selectedId===id?null:id;
@@ -742,7 +815,7 @@ function selectContact(id){
   updateSidebar();
 }
 function setWsStatus(s){const dot=document.getElementById('ws-dot'),lbl=document.getElementById('ws-label');dot.className=s==='live'?'live':s==='err'?'err':'';lbl.textContent=s==='live'?'LIVE':s==='connecting'?'CONNECTING':'OFFLINE';lbl.style.color=s==='live'?'var(--green)':s==='connecting'?'var(--amber)':'var(--muted)';}
-function initWS(){clearTimeout(reconnectTimer);if(ws){try{ws.close();}catch(e){}}setWsStatus('connecting');const proto=location.protocol==='https:'?'wss:':'ws:';ws=new WebSocket(proto+'//'+location.host+'/ws/radar');ws.onopen=()=>setWsStatus('live');ws.onmessage=(evt)=>{try{const f=JSON.parse(evt.data);selfData=f.self;contacts=f.contacts||[];if(selfData)contacts.forEach(c=>{c.dist_m=haversine(selfData.lat,selfData.lon,c.lat,c.lon);});updateSidebar();}catch(e){};};ws.onerror=()=>{};ws.onclose=()=>{setWsStatus('err');reconnectTimer=setTimeout(initWS,3000);};}
+function initWS(){clearTimeout(reconnectTimer);if(ws){try{ws.close();}catch(e){}}setWsStatus('connecting');const proto=location.protocol==='https:'?'wss:':'ws:';ws=new WebSocket(proto+'//'+location.host+'/ws/radar');ws.onopen=()=>setWsStatus('live');ws.onmessage=(evt)=>{try{const f=JSON.parse(evt.data);selfData=f.self;contacts=f.contacts||[];if(selfData)contacts.forEach(c=>{c.dist_m=haversine(selfData.lat,selfData.lon,c.lat,c.lon);});updateSidebar();}catch(e){};};ws.onerror=()=>{};ws.onclose=()=>{setWsStatus('err');reconnectTimer=setTimeout(initWS,3000);}}
 resize();startAnim();initWS();
 </script>
 </body></html>"""
