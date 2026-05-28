@@ -545,6 +545,381 @@ drawADI(0,0);drawHeadingTape(0);initWS();
 
 
 # ----------------------------------------------------------------
+# Radar — Tactical scope (War Thunder)
+# ----------------------------------------------------------------
+@app.get("/radar", response_class=HTMLResponse, tags=["Radar"], include_in_schema=False)
+async def radar():
+    html = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WT IOX — Radar</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700&display=swap');
+  :root{
+    --bg:#060a06;--panel:#0a0f0a;--border:#1a2a1a;
+    --green:#39ff6e;--green-dim:#1a5a30;--amber:#ffb830;--red:#ff4040;--blue:#40c8ff;
+    --text:#c8e8c8;--muted:#3a5a3a;
+    --font-mono:'Share Tech Mono',monospace;--font-hud:'Orbitron',sans-serif;
+    --glow:0 0 10px rgba(57,255,110,0.4);
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--font-mono);font-size:12px;
+       min-height:100vh;display:flex;flex-direction:column;align-items:center;overflow:hidden}
+
+  #topbar{width:100%;display:flex;align-items:center;justify-content:space-between;
+          padding:8px 20px;border-bottom:1px solid var(--border);background:var(--panel);flex-shrink:0}
+  .logo{font-family:var(--font-hud);font-size:13px;font-weight:700;color:var(--green);
+        letter-spacing:.15em;text-shadow:var(--glow)}
+  .logo span{color:var(--muted);font-weight:400;font-size:10px;margin-left:8px}
+  #ws-badge{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+  #ws-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);transition:background .3s}
+  #ws-dot.live{background:var(--green);box-shadow:var(--glow);animation:pulse 2s infinite}
+  #ws-dot.err{background:var(--red)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  #scope-wrap{position:relative;flex:1;display:flex;align-items:center;justify-content:center;
+              width:100%;padding:16px}
+  #scope{border-radius:50%;border:1px solid var(--green-dim);box-shadow:inset 0 0 60px rgba(0,30,0,.8),var(--glow);
+         cursor:crosshair;display:block}
+
+  /* sweep overlay rendered via canvas — no DOM overhead */
+
+  #hud-overlay{position:absolute;bottom:28px;left:50%;transform:translateX(-50%);
+               display:flex;gap:24px;background:rgba(6,10,6,.75);border:1px solid var(--border);
+               border-radius:6px;padding:6px 18px;backdrop-filter:blur(4px)}
+  .hud-cell{display:flex;flex-direction:column;align-items:center;gap:1px}
+  .hud-lbl{font-size:9px;color:var(--muted);letter-spacing:.12em;text-transform:uppercase}
+  .hud-val{font-family:var(--font-hud);font-size:13px;color:var(--green)}
+
+  #contact-list{position:absolute;top:70px;right:16px;width:220px;
+                background:rgba(6,10,6,.85);border:1px solid var(--border);border-radius:6px;
+                overflow-y:auto;max-height:calc(100vh - 120px);backdrop-filter:blur(4px)}
+  #contact-list-header{padding:6px 10px;border-bottom:1px solid var(--border);
+                       font-family:var(--font-hud);font-size:10px;color:var(--muted);
+                       letter-spacing:.1em;display:flex;justify-content:space-between}
+  .contact-row{display:grid;grid-template-columns:14px 1fr 52px 44px;gap:4px;align-items:center;
+               padding:4px 10px;border-bottom:1px solid rgba(57,255,110,.05);transition:background .1s}
+  .contact-row:last-child{border-bottom:none}
+  .contact-row:hover{background:rgba(57,255,110,.04)}
+  .c-dot{width:7px;height:7px;border-radius:50%}
+  .c-name{font-size:10px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .c-dist{font-size:10px;color:var(--muted);text-align:right}
+  .c-alt{font-size:10px;color:var(--muted);text-align:right}
+
+  #offline-overlay{display:none;position:fixed;inset:0;background:rgba(6,10,6,.9);z-index:200;
+                   align-items:center;justify-content:center;flex-direction:column;gap:12px;
+                   font-family:var(--font-hud);color:var(--red);font-size:16px;letter-spacing:.1em}
+  #offline-overlay.show{display:flex}
+  #offline-overlay small{font-family:var(--font-mono);font-size:11px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div id="offline-overlay">
+  <div>&#9888; NO SIGNAL</div>
+  <small id="offline-msg">Connecting to wt-iox-api…</small>
+</div>
+
+<div id="topbar">
+  <div class="logo">WT IOX <span>RADAR SCOPE</span></div>
+  <div style="display:flex;gap:16px;align-items:center">
+    <span id="own-ship-id" style="font-family:var(--font-hud);font-size:11px;color:var(--amber)">—</span>
+    <div id="ws-badge"><div id="ws-dot"></div><span id="ws-lbl">OFFLINE</span></div>
+  </div>
+</div>
+
+<div id="scope-wrap">
+  <canvas id="scope"></canvas>
+
+  <div id="hud-overlay">
+    <div class="hud-cell"><div class="hud-lbl">HDG</div><div class="hud-val" id="hud-hdg">---°</div></div>
+    <div class="hud-cell"><div class="hud-lbl">ALT</div><div class="hud-val" id="hud-alt">--- m</div></div>
+    <div class="hud-cell"><div class="hud-lbl">IAS</div><div class="hud-val" id="hud-ias">--- km/h</div></div>
+    <div class="hud-cell"><div class="hud-lbl">CONTACTS</div><div class="hud-val" id="hud-contacts">0</div></div>
+    <div class="hud-cell"><div class="hud-lbl">RANGE</div><div class="hud-val" id="hud-range">50 km</div></div>
+  </div>
+
+  <div id="contact-list">
+    <div id="contact-list-header"><span>CONTACTS</span><span id="cl-count">0</span></div>
+    <div id="cl-rows"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---- Config ----
+const RANGES_KM = [10, 25, 50, 100, 200];
+let rangeIdx = 2;  // default 50 km
+const SWEEP_RPM = 6;
+const FPS = 30;
+
+// ---- Canvas setup ----
+const canvas = document.getElementById('scope');
+const ctx = canvas.getContext('2d');
+let CX, CY, R;
+
+function resizeScope() {
+  const wrap = document.getElementById('scope-wrap');
+  const listW = 240;
+  const pad = 32;
+  const avW = wrap.clientWidth - listW - pad * 2;
+  const avH = wrap.clientHeight - pad * 2;
+  const size = Math.min(avW, avH, 640);
+  canvas.width = size;
+  canvas.height = size;
+  CX = size / 2; CY = size / 2; R = size / 2 - 4;
+}
+resizeScope();
+window.addEventListener('resize', resizeScope);
+
+// ---- Range cycling ----
+canvas.addEventListener('click', () => {
+  rangeIdx = (rangeIdx + 1) % RANGES_KM.length;
+  document.getElementById('hud-range').textContent = RANGES_KM[rangeIdx] + ' km';
+});
+
+// ---- State ----
+let frame = { wt_connected: false, self: null, contacts: [], ts: 0 };
+let sweepAngle = -Math.PI / 2;  // start pointing up (north)
+let trails = {};  // uid -> [{x,y,age}]
+const MAX_TRAIL = 8;
+
+// ---- Coalition colours ----
+function contactColor(c) {
+  const coal = (c.coalition || '').toLowerCase();
+  if (coal === 'allies' || coal === 'blue' || coal === 'friendly') return '#40c8ff';
+  if (coal === 'axis'   || coal === 'red'  || coal === 'enemy')    return '#ff4040';
+  return '#ffb830';  // unknown / neutral
+}
+
+// ---- World → scope coords ----
+function toScope(selfLat, selfLon, cLat, cLon) {
+  const R_EARTH = 6371000;
+  const rangeM = RANGES_KM[rangeIdx] * 1000;
+  const dLat = (cLat - selfLat) * Math.PI / 180 * R_EARTH;
+  const dLon = (cLon - selfLon) * Math.PI / 180 * R_EARTH * Math.cos(selfLat * Math.PI / 180);
+  const sx = CX + (dLon / rangeM) * R;
+  const sy = CY - (dLat / rangeM) * R;
+  return { x: sx, y: sy, inRange: Math.hypot(dLon, dLat) <= rangeM };
+}
+
+// ---- Draw ----
+let lastTs = 0;
+function draw(ts) {
+  const dt = (ts - lastTs) / 1000;
+  lastTs = ts;
+  sweepAngle += (SWEEP_RPM * 2 * Math.PI / 60) * dt;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Background
+  const bgGrad = ctx.createRadialGradient(CX, CY, 0, CX, CY, R);
+  bgGrad.addColorStop(0, '#0a1a0a');
+  bgGrad.addColorStop(1, '#060a06');
+  ctx.fillStyle = bgGrad;
+  ctx.beginPath(); ctx.arc(CX, CY, R, 0, Math.PI * 2); ctx.fill();
+
+  // Range rings
+  ctx.strokeStyle = '#1a2a1a'; ctx.lineWidth = 1;
+  for (let i = 1; i <= 4; i++) {
+    ctx.beginPath(); ctx.arc(CX, CY, R * i / 4, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  // Cardinal cross-hairs
+  ctx.strokeStyle = '#1a3a1a'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(CX, CY - R); ctx.lineTo(CX, CY + R); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(CX - R, CY); ctx.lineTo(CX + R, CY); ctx.stroke();
+
+  // Sweep gradient
+  ctx.save();
+  ctx.translate(CX, CY);
+  const sweepGrad = ctx.createConicalGradient
+    ? ctx.createConicalGradient(0, 0, sweepAngle)
+    : null;
+
+  // Fallback sweep via arc fill
+  const sweepSpan = Math.PI * 0.35;
+  const g = ctx.createConicGradient(sweepAngle - sweepSpan, 0, 0);
+  g.addColorStop(0, 'rgba(57,255,110,0)');
+  g.addColorStop(1, 'rgba(57,255,110,0.18)');
+  ctx.beginPath(); ctx.arc(0, 0, R, sweepAngle - sweepSpan, sweepAngle); ctx.lineTo(0, 0); ctx.closePath();
+  ctx.fillStyle = g; ctx.fill();
+
+  // Sweep line
+  ctx.strokeStyle = '#39ff6e'; ctx.lineWidth = 1.5;
+  ctx.shadowBlur = 6; ctx.shadowColor = '#39ff6e';
+  ctx.beginPath(); ctx.moveTo(0, 0);
+  ctx.lineTo(Math.cos(sweepAngle) * R, Math.sin(sweepAngle) * R); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  // Clip to circle
+  ctx.save();
+  ctx.beginPath(); ctx.arc(CX, CY, R, 0, Math.PI * 2); ctx.clip();
+
+  const self = frame.self;
+  const contacts = frame.contacts || [];
+
+  if (self && frame.wt_connected) {
+    // ---- Contacts ----
+    contacts.forEach(c => {
+      const pos = toScope(self.lat, self.lon, c.lat, c.lon);
+      if (!pos.inRange) return;
+
+      // Trail
+      if (!trails[c.id]) trails[c.id] = [];
+      const trail = trails[c.id];
+      trail.push({ x: pos.x, y: pos.y });
+      if (trail.length > MAX_TRAIL) trail.shift();
+
+      const col = contactColor(c);
+
+      // Draw trail
+      trail.forEach((pt, i) => {
+        const alpha = (i + 1) / trail.length * 0.4;
+        ctx.fillStyle = col.replace(')', `,${alpha})`).replace('rgb', 'rgba');
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 2, 0, Math.PI * 2); ctx.fill();
+      });
+
+      // Contact blip
+      ctx.fillStyle = col;
+      ctx.shadowBlur = 8; ctx.shadowColor = col;
+      ctx.beginPath(); ctx.arc(pos.x, pos.y, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+
+      // Heading tick
+      if (c.heading_deg != null) {
+        const hRad = (c.heading_deg - 90) * Math.PI / 180;
+        ctx.strokeStyle = col; ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pos.x, pos.y);
+        ctx.lineTo(pos.x + Math.cos(hRad) * 10, pos.y + Math.sin(hRad) * 10);
+        ctx.stroke();
+      }
+
+      // Label
+      ctx.fillStyle = col;
+      ctx.font = '9px Share Tech Mono';
+      ctx.fillText((c.name || c.type || '?').substring(0, 10), pos.x + 7, pos.y - 4);
+    });
+
+    // ---- Own ship ----
+    const hdgRad = ((self.heading_deg || 0) - 90) * Math.PI / 180;
+    ctx.fillStyle = '#39ff6e';
+    ctx.shadowBlur = 12; ctx.shadowColor = '#39ff6e';
+    ctx.beginPath(); ctx.arc(CX, CY, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Own-ship heading vector
+    ctx.strokeStyle = '#39ff6e'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(CX, CY);
+    ctx.lineTo(CX + Math.cos(hdgRad) * 20, CY + Math.sin(hdgRad) * 20);
+    ctx.stroke();
+  } else {
+    // Offline — dim centre dot
+    ctx.fillStyle = '#2a4a2a';
+    ctx.beginPath(); ctx.arc(CX, CY, 4, 0, Math.PI * 2); ctx.fill();
+  }
+
+  ctx.restore();
+
+  // Border
+  ctx.strokeStyle = '#1a4a1a'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(CX, CY, R, 0, Math.PI * 2); ctx.stroke();
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// ---- Contact list sidebar ----
+function updateSidebar(contacts) {
+  const rows = document.getElementById('cl-rows');
+  document.getElementById('cl-count').textContent = contacts.length;
+  if (!contacts.length) { rows.innerHTML = ''; return; }
+  const sorted = [...contacts].sort((a, b) => (a.dist_m || 0) - (b.dist_m || 0));
+  rows.innerHTML = sorted.map(c => {
+    const col = contactColor(c);
+    const dist = c.dist_m != null ? (c.dist_m / 1000).toFixed(1) + ' km' : '—';
+    const alt  = c.alt_msl_m != null ? Math.round(c.alt_msl_m) + ' m' : '—';
+    return `<div class="contact-row">
+      <div class="c-dot" style="background:${col}"></div>
+      <div class="c-name">${(c.name || c.type || 'unknown').substring(0, 14)}</div>
+      <div class="c-dist">${dist}</div>
+      <div class="c-alt">${alt}</div>
+    </div>`;
+  }).join('');
+}
+
+// ---- HUD ----
+function updateHud(self) {
+  if (!self) return;
+  document.getElementById('hud-hdg').textContent = Math.round(self.heading_deg || 0) + '°';
+  document.getElementById('hud-alt').textContent = Math.round(self.alt_msl_m || 0) + ' m';
+  document.getElementById('hud-ias').textContent = Math.round((self.ias_ms || 0) * 3.6) + ' km/h';
+  document.getElementById('own-ship-id').textContent = (self.aircraft || '—').toUpperCase();
+}
+
+// ---- WebSocket ----
+let ws = null, retryTimer = null;
+
+function setStatus(s) {
+  const dot = document.getElementById('ws-dot');
+  const lbl = document.getElementById('ws-lbl');
+  dot.className = '';
+  if (s === 'live')        { dot.classList.add('live'); lbl.textContent = 'LIVE';       lbl.style.color = 'var(--green)'; }
+  else if (s === 'conn')   { lbl.textContent = 'CONNECTING'; lbl.style.color = 'var(--amber)'; }
+  else                     { dot.classList.add('err'); lbl.textContent = 'OFFLINE'; lbl.style.color = 'var(--red)'; }
+}
+
+function initWS() {
+  clearTimeout(retryTimer);
+  if (ws) { try { ws.close(); } catch(e) {} ws = null; }
+  setStatus('conn');
+  document.getElementById('offline-msg').textContent = 'Connecting to /ws/radar…';
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws/radar');
+
+  ws.onopen = () => {
+    setStatus('live');
+    document.getElementById('offline-overlay').classList.remove('show');
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      frame = JSON.parse(evt.data);
+      document.getElementById('hud-contacts').textContent = (frame.contacts || []).length;
+      updateHud(frame.self);
+      updateSidebar(frame.contacts || []);
+      if (!frame.wt_connected) {
+        document.getElementById('offline-overlay').classList.add('show');
+        document.getElementById('offline-msg').textContent = 'War Thunder not detected';
+      } else {
+        document.getElementById('offline-overlay').classList.remove('show');
+      }
+    } catch(e) {}
+  };
+
+  ws.onerror = () => {};
+  ws.onclose = (evt) => {
+    setStatus('offline');
+    document.getElementById('offline-overlay').classList.add('show');
+    document.getElementById('offline-msg').textContent = 'Disconnected (' + evt.code + '). Retry in 3s…';
+    retryTimer = setTimeout(initWS, 3000);
+  };
+}
+
+initWS();
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+# ----------------------------------------------------------------
 # WebSocket endpoints
 # ----------------------------------------------------------------
 @app.websocket("/ws/telemetry")
