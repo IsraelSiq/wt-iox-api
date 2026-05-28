@@ -400,9 +400,9 @@ function updateHUD(s){
   const rpm=s.rpm_1||s.rpm_2;if(rpm)setVal('rpm-val',Math.round(rpm));
   const vviMs=s.vvi_ms||0;const vsimpm=Math.round(vviMs*60);
   setVal('vsi-val',(vsimpm>=0?'+':'')+vsimpm.toLocaleString());
-  const vsiEl=$('vsi-arrow');if(vsimpm>50){vsiEl.textContent='▲';vsiEl.style.color='var(--green)';}else if(vsimpm<-50){vsiEl.textContent='▼';vsiEl.style.color='var(--red)';}else{vsiEl.textContent='▶';vsiEl.style.color='var(--muted)';}
+  const vsiEl=$('vsi-arrow');if(vsimpm>50){vsiEl.textContent='\u25b2';vsiEl.style.color='var(--green)';}else if(vsimpm<-50){vsiEl.textContent='\u25bc';vsiEl.style.color='var(--red)';}else{vsiEl.textContent='\u25b6';vsiEl.style.color='var(--muted)';}
   const hdg=s.heading_deg||0;
-  setVal('hdg-val',Math.round(hdg)+'°');setVal('pitch-val',(s.pitch_deg||0).toFixed(1)+'°');setVal('bank-val',(s.bank_deg||0).toFixed(1)+'°');
+  setVal('hdg-val',Math.round(hdg)+'\u00b0');setVal('pitch-val',(s.pitch_deg||0).toFixed(1)+'\u00b0');setVal('bank-val',(s.bank_deg||0).toFixed(1)+'\u00b0');
   setVal('lat-val',(s.lat||0).toFixed(4));setVal('lon-val',(s.lon||0).toFixed(4));setVal('pkt-val',packetCount.toLocaleString());
   drawADI(s.pitch_deg||0,s.bank_deg||0);drawHeadingTape(hdg);updateFPS();
 }
@@ -432,7 +432,7 @@ drawADI(0,0);drawHeadingTape(0);initWS();
 # ----------------------------------------------------------------
 @app.get("/radar", response_class=HTMLResponse, tags=["Radar"], include_in_schema=False)
 async def radar():
-    """PPI Tactical Radar — sweep animation, trails, altitude filter, threat alert."""
+    """PPI Tactical Radar — sweep animation, trails, altitude filter, category filter, threat alert."""
     html = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -499,6 +499,20 @@ async def radar():
   .toggle-row{display:flex;align-items:center;justify-content:space-between;padding:4px 0}
   .toggle-row label{font-size:11px;color:var(--muted)}
   .toggle-row input[type=checkbox]{accent-color:var(--green);width:14px;height:14px;cursor:pointer}
+  /* Category filter toggle buttons */
+  .cat-filter-row{display:flex;gap:6px;flex-wrap:wrap}
+  .cat-btn{
+    flex:1;padding:4px 6px;background:none;
+    border:1px solid var(--border);color:var(--muted);
+    font-family:var(--font);font-size:10px;letter-spacing:.08em;
+    border-radius:3px;cursor:pointer;transition:all .15s;text-align:center;
+    text-transform:uppercase;
+  }
+  .cat-btn:hover{border-color:var(--green-mid);color:var(--text)}
+  .cat-btn.active{border-color:var(--green);color:var(--green);background:rgba(57,255,110,.1);}
+  .cat-btn[data-cat="Air"].active{border-color:var(--blue);color:var(--blue);background:rgba(64,200,255,.1);}
+  .cat-btn[data-cat="Ground"].active{border-color:var(--amber);color:var(--amber);background:rgba(255,184,48,.1);}
+  .cat-btn[data-cat="Naval"].active{border-color:#7ec8e3;color:#7ec8e3;background:rgba(126,200,227,.1);}
 </style>
 </head>
 <body>
@@ -516,10 +530,10 @@ async def radar():
   <div id="sidebar">
     <div class="side-section">
       <div class="side-title">OWN SHIP</div>
-      <div class="kv"><span class="kv-label">Vehicle</span><span class="kv-value" id="s-aircraft">—</span></div>
-      <div class="kv"><span class="kv-label">HDG</span><span class="kv-value" id="s-hdg">—</span></div>
-      <div class="kv"><span class="kv-label">IAS</span><span class="kv-value" id="s-ias">—</span></div>
-      <div class="kv"><span class="kv-label">ALT</span><span class="kv-value" id="s-alt">—</span></div>
+      <div class="kv"><span class="kv-label">Vehicle</span><span class="kv-value" id="s-aircraft">&#8212;</span></div>
+      <div class="kv"><span class="kv-label">HDG</span><span class="kv-value" id="s-hdg">&#8212;</span></div>
+      <div class="kv"><span class="kv-label">IAS</span><span class="kv-value" id="s-ias">&#8212;</span></div>
+      <div class="kv"><span class="kv-label">ALT</span><span class="kv-value" id="s-alt">&#8212;</span></div>
     </div>
     <div class="side-section">
       <div class="side-title">RANGE</div>
@@ -528,6 +542,14 @@ async def radar():
         <button class="range-btn" onclick="setRange(20000)">20</button>
         <button class="range-btn" onclick="setRange(50000)">50</button>
         <button class="range-btn active" onclick="setRange(100000)">100</button>
+      </div>
+    </div>
+    <div class="side-section">
+      <div class="side-title">CATEGORY FILTER</div>
+      <div class="cat-filter-row">
+        <button class="cat-btn active" data-cat="Air" onclick="toggleCat('Air')">&#9992; Air</button>
+        <button class="cat-btn active" data-cat="Ground" onclick="toggleCat('Ground')">&#9651; Ground</button>
+        <button class="cat-btn active" data-cat="Naval" onclick="toggleCat('Naval')">&#9875; Naval</button>
       </div>
     </div>
     <div class="side-section">
@@ -567,6 +589,31 @@ async def radar():
 const canvas=document.getElementById('radar-canvas'),ctx=canvas.getContext('2d');
 let radarRange=100000,selfData=null,contacts=[],selectedId=null,ws=null,reconnectTimer=null;
 let altMinM=0,altMaxM=15000;
+
+// --- Category filter state (in-memory, no localStorage) ---
+const catFilters={Air:true,Ground:true,Naval:true};
+
+function toggleCat(cat){
+  catFilters[cat]=!catFilters[cat];
+  const btn=document.querySelector('.cat-btn[data-cat="'+cat+'"]');
+  if(btn)btn.classList.toggle('active',catFilters[cat]);
+  updateSidebar();
+}
+
+function filterEnabled(category){
+  // Map contact category string to one of Air/Ground/Naval
+  // WT categories can vary; we normalise with a best-effort match
+  if(!category) return true;          // unknown category — always show
+  const c=category.toLowerCase();
+  if(c.includes('air') || c.includes('plane') || c.includes('helicopter') || c.includes('heli'))
+    return catFilters['Air'];
+  if(c.includes('ground') || c.includes('tank') || c.includes('vehicle') || c.includes('spaa') || c.includes('aaa'))
+    return catFilters['Ground'];
+  if(c.includes('naval') || c.includes('ship') || c.includes('boat') || c.includes('destroyer') || c.includes('cruiser'))
+    return catFilters['Naval'];
+  return true; // unrecognised — show by default
+}
+
 const trails={};const TRAIL_MAX=8,TRAIL_TTL=15000;
 let sweepAngle=0;const SWEEP_SPEED=36;
 let lastSweepTime=performance.now();
@@ -576,7 +623,12 @@ function startAnim(){if(!animFrameId)animFrameId=requestAnimationFrame(animLoop)
 function animLoop(now){
   const dt=(now-lastSweepTime)/1000;lastSweepTime=now;
   sweepAngle=(sweepAngle+SWEEP_SPEED*dt)%360;
-  if(selfData){contacts.forEach(c=>{const brg=bearing(selfData.lat,selfData.lon,c.lat,c.lon);const diff=Math.abs(((brg-sweepAngle+540)%360)-180);if(diff<3)contactSweepTs[c.id]=now;});}
+  if(selfData){contacts.forEach(c=>{
+    if(!filterEnabled(c.category))return;
+    const brg=bearing(selfData.lat,selfData.lon,c.lat,c.lon);
+    const diff=Math.abs(((brg-sweepAngle+540)%360)-180);
+    if(diff<3)contactSweepTs[c.id]=now;
+  });}
   draw(now);animFrameId=requestAnimationFrame(animLoop);
 }
 function resize(){const wrap=document.getElementById('radar-wrap');const sz=Math.min(wrap.clientWidth,wrap.clientHeight)-40;canvas.width=sz;canvas.height=sz;}
@@ -608,6 +660,8 @@ function draw(now){
   const nowTs=now||performance.now();
   let threatDetected=false;
   if(selfData){contacts.forEach(c=>{
+    // --- category filter ---
+    if(!filterEnabled(c.category))return;
     const pos=contactToXY(c,CX,CY,R);if(!pos)return;
     const altM=c.alt_msl_m||0;if(altM<altMinM||altM>altMaxM)return;
     const color=iffColor(c.coalition);const isSelected=c.id===selectedId;
@@ -640,18 +694,22 @@ function draw(now){
   const alert=document.getElementById('threat-alert');if(threatDetected)alert.classList.add('show');else alert.classList.remove('show');
 }
 function updateSidebar(){
-  if(selfData){document.getElementById('s-aircraft').textContent=(selfData.aircraft||'—').toUpperCase();document.getElementById('s-hdg').textContent=Math.round(selfData.heading_deg||0)+'°';document.getElementById('s-ias').textContent=Math.round((selfData.ias_ms||0)*3.6)+' km/h';document.getElementById('s-alt').textContent=Math.round(selfData.alt_msl_m||0).toLocaleString()+' m';}
-  const n=contacts.length;document.getElementById('contact-count').textContent=n;document.getElementById('contact-count-2').textContent=n;
+  if(selfData){document.getElementById('s-aircraft').textContent=(selfData.aircraft||'\u2014').toUpperCase();document.getElementById('s-hdg').textContent=Math.round(selfData.heading_deg||0)+'\u00b0';document.getElementById('s-ias').textContent=Math.round((selfData.ias_ms||0)*3.6)+' km/h';document.getElementById('s-alt').textContent=Math.round(selfData.alt_msl_m||0).toLocaleString()+' m';}
+  // filter contacts by category before rendering the list
+  const visible=contacts.filter(c=>filterEnabled(c.category));
+  const n=visible.length;
+  document.getElementById('contact-count').textContent=n;
+  document.getElementById('contact-count-2').textContent=n;
   const list=document.getElementById('contact-list');
   if(!n){list.innerHTML='<div style="color:var(--muted);font-size:11px;padding:8px 0;text-align:center">No contacts</div>';return;}
-  const sorted=[...contacts].sort((a,b)=>a.dist_m-b.dist_m);
-  list.innerHTML=sorted.map(c=>{const color=iffColor(c.coalition);const dist=c.dist_m>=1000?(c.dist_m/1000).toFixed(1)+'km':Math.round(c.dist_m)+'m';const alt=Math.round(c.alt_msl_m||0);const isThreat=c.coalition===2&&c.dist_m<20000;return`<div class="contact-row${c.id===selectedId?' selected':''}${isThreat?' threat':''}" onclick="selectContact('${c.id}')"><div class="iff-dot" style="background:${color}"></div><div class="contact-name">${c.name||c.id}</div><div class="contact-dist">${dist}</div><div class="contact-alt">${alt}m</div></div>`;}).join('');
+  const sorted=[...visible].sort((a,b)=>a.dist_m-b.dist_m);
+  list.innerHTML=sorted.map(c=>{const color=iffColor(c.coalition);const dist=c.dist_m>=1000?(c.dist_m/1000).toFixed(1)+'km':Math.round(c.dist_m)+'m';const alt=Math.round(c.alt_msl_m||0);const isThreat=c.coalition===2&&c.dist_m<20000;return'<div class="contact-row'+(c.id===selectedId?' selected':'')+(isThreat?' threat':'')+'" onclick="selectContact(\'' + c.id + '\')"><div class="iff-dot" style="background:'+color+'"></div><div class="contact-name">'+(c.name||c.id)+'</div><div class="contact-dist">'+dist+'</div><div class="contact-alt">'+alt+'m</div></div>';}).join('');
 }
 function selectContact(id){
   selectedId=selectedId===id?null:id;
   const c=contacts.find(x=>x.id===id);const panel=document.getElementById('detail-panel');
   if(c&&selectedId){const color=iffColor(c.coalition);const dist=c.dist_m>=1000?(c.dist_m/1000).toFixed(1)+' km':Math.round(c.dist_m)+' m';
-    panel.className='show';panel.innerHTML=`<div style="font-family:var(--hud);font-size:11px;color:${color};margin-bottom:8px">${(c.name||c.id).toUpperCase()}</div><div class="kv"><span class="kv-label">Type</span><span class="kv-value" style="font-size:11px">${c.type||'—'}</span></div><div class="kv"><span class="kv-label">Category</span><span class="kv-value" style="font-size:11px">${c.category||'—'}</span></div><div class="kv"><span class="kv-label">Distance</span><span class="kv-value" style="font-size:11px">${dist}</span></div><div class="kv"><span class="kv-label">Altitude</span><span class="kv-value" style="font-size:11px">${Math.round(c.alt_msl_m||0).toLocaleString()} m</span></div><div class="kv"><span class="kv-label">Heading</span><span class="kv-value" style="font-size:11px">${Math.round(c.heading_deg||0)}°</span></div><div class="kv"><span class="kv-label">Coalition</span><span class="kv-value" style="font-size:11px;color:${color}">${c.coalition===1?'ALLIES':c.coalition===2?'ENEMIES':'NEUTRAL'}</span></div>`;}
+    panel.className='show';panel.innerHTML='<div style="font-family:var(--hud);font-size:11px;color:'+color+';margin-bottom:8px">'+(c.name||c.id).toUpperCase()+'</div><div class="kv"><span class="kv-label">Type</span><span class="kv-value" style="font-size:11px">'+(c.type||'\u2014')+'</span></div><div class="kv"><span class="kv-label">Category</span><span class="kv-value" style="font-size:11px">'+(c.category||'\u2014')+'</span></div><div class="kv"><span class="kv-label">Distance</span><span class="kv-value" style="font-size:11px">'+dist+'</span></div><div class="kv"><span class="kv-label">Altitude</span><span class="kv-value" style="font-size:11px">'+Math.round(c.alt_msl_m||0).toLocaleString()+' m</span></div><div class="kv"><span class="kv-label">Heading</span><span class="kv-value" style="font-size:11px">'+Math.round(c.heading_deg||0)+'\u00b0</span></div><div class="kv"><span class="kv-label">Coalition</span><span class="kv-value" style="font-size:11px;color:'+color+'">'+(c.coalition===1?'ALLIES':c.coalition===2?'ENEMIES':'NEUTRAL')+'</span></div>';}
   else{panel.className='';panel.innerHTML='';}
   updateSidebar();
 }
