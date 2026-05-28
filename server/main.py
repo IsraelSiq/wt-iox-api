@@ -39,29 +39,23 @@ URL_STATE     = f"{WT_BASE}/state"
 URL_MAP_OBJ   = f"{WT_BASE}/map_obj.json"
 URL_MAP_INFO  = f"{WT_BASE}/map_info.json"
 
-# Map size in meters (fetched once on startup, used for coord conversion)
-_map_size_m: float = 65536.0   # default Caucasus-ish; overwritten from map_info
-
+_map_size_m: float = 65536.0
 
 # ----------------------------------------------------------------
-# Coordinate conversion: WT X/Y (0.0-1.0) -> Lat/Lon
-# WT map origin varies by map. We approximate using a flat-earth
-# projection centered on the map's bounding box.
-# map_info.json provides: map_min/max in meters from world origin.
+# Coordinate conversion
 # ----------------------------------------------------------------
 _map_x_min: float = 0.0
 _map_x_max: float = 65536.0
 _map_y_min: float = 0.0
 _map_y_max: float = 65536.0
 
-# Approximate lat/lon center per WT map (used as anchor)
 MAP_CENTERS = {
-    "avg_war": (50.0, 30.0),      # Russo-German front (avg)
-    "pacific": (25.0, 135.0),
-    "normandy": (49.3, -0.7),
-    "tunisia": (36.8, 10.2),
-    "korea": (37.5, 127.0),
-    "vietnam": (21.0, 105.8),
+    "avg_war":  (50.0,  30.0),
+    "pacific":  (25.0, 135.0),
+    "normandy": (49.3,  -0.7),
+    "tunisia":  (36.8,  10.2),
+    "korea":    (37.5, 127.0),
+    "vietnam":  (21.0, 105.8),
 }
 DEFAULT_CENTER = (48.0, 15.0)
 _anchor_lat: float = DEFAULT_CENTER[0]
@@ -69,7 +63,6 @@ _anchor_lon: float = DEFAULT_CENTER[1]
 
 
 def xy_to_latlon(x_norm: float, y_norm: float) -> tuple[float, float]:
-    """Convert WT normalized X/Y (0-1) to approximate lat/lon."""
     x_m = _map_x_min + x_norm * (_map_x_max - _map_x_min)
     y_m = _map_y_min + y_norm * (_map_y_max - _map_y_min)
     lat = _anchor_lat + (y_m - (_map_y_max - _map_y_min) / 2) / 111320
@@ -86,13 +79,55 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 
 
 # ----------------------------------------------------------------
+# Icon -> Category mapping
+# Based on actual WT map_obj.json icon values observed in-game.
+# WT sends icon as a string; values are case-insensitive matched.
+#
+# Air icons  : aircraft, fighter, bomber, attacker, aviation,
+#              helicopter, heli, plane, jet
+# Ground icons: tank, car, truck, spaa, aaa, artillery,
+#               armoured, vehicle, ground
+# Naval icons : ship, destroyer, cruiser, carrier, boat, naval,
+#               frigate, submarine
+# ----------------------------------------------------------------
+_AIR_ICONS = {
+    "aircraft", "fighter", "bomber", "attacker", "aviation",
+    "helicopter", "heli", "plane", "jet", "torpedo_bomber",
+}
+_GROUND_ICONS = {
+    "tank", "car", "truck", "spaa", "aaa", "artillery",
+    "armoured", "vehicle", "ground", "air_defence",
+}
+_NAVAL_ICONS = {
+    "ship", "destroyer", "cruiser", "carrier", "boat",
+    "naval", "frigate", "submarine",
+}
+
+
+def _icon_to_category(icon: str) -> str:
+    """Map WT icon string to Air / Ground / Naval. Defaults to Ground."""
+    key = icon.lower().strip()
+    if key in _AIR_ICONS:
+        return "Air"
+    if key in _NAVAL_ICONS:
+        return "Naval"
+    # Partial-match fallback for compound icon names (e.g. "light_tank")
+    for air in _AIR_ICONS:
+        if air in key:
+            return "Air"
+    for nav in _NAVAL_ICONS:
+        if nav in key:
+            return "Naval"
+    return "Ground"
+
+
+# ----------------------------------------------------------------
 # Contacts ingestion
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
     for obj in raw_objects:
         try:
-            # Skip the player marker itself
             icon = obj.get("icon", "")
             if icon in ("Player", "Waypoint"):
                 continue
@@ -104,15 +139,11 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             coalition_str = obj.get("color", "neutral").lower()
             coalition = {"blue": 1, "allies": 1, "red": 2, "enemies": 2}.get(coalition_str, 0)
 
-            hdg = float(obj.get("dx", 0.0))   # WT gives heading as dx/dy unit vector
+            hdg = float(obj.get("dx", 0.0))
             ddy = float(obj.get("dy", 0.0))
             heading_deg = math.degrees(math.atan2(hdg, ddy)) % 360
 
-            category = "Ground"
-            if icon in ("Fighter", "Bomber", "Attacker", "Aviation", "Helicopter"):
-                category = "Air"
-            elif icon in ("Ship", "Destroyer", "Cruiser", "Carrier"):
-                category = "Naval"
+            category = _icon_to_category(icon)
 
             dist_m = haversine(player_lat, player_lon, lat, lon) if (player_lat or player_lon) else 0.0
 
@@ -124,7 +155,7 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
                 category=category,
                 lat=lat,
                 lon=lon,
-                alt_msl_m=float(obj.get("alt", 0)) * 0.3048,  # WT alt in feet -> meters
+                alt_msl_m=float(obj.get("alt", 0)) * 0.3048,
                 heading_deg=heading_deg,
                 speed_ms=0.0,
                 speed_kts=0.0,
@@ -165,7 +196,6 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
 # Extract player position from map_obj Player marker
 # ----------------------------------------------------------------
 def _extract_player_pos(raw_objects: list) -> tuple[float, float] | None:
-    """Return (lat, lon) of the Player marker, or None if not found."""
     for obj in raw_objects:
         if obj.get("icon") == "Player":
             ox = obj.get("x", None)
@@ -179,19 +209,19 @@ def _extract_player_pos(raw_objects: list) -> tuple[float, float] | None:
 # WT state -> AircraftState
 # ----------------------------------------------------------------
 def _parse_state(data: dict, lat: float = 0.0, lon: float = 0.0) -> AircraftState:
-    ias_ms  = float(data.get("IAS, km/h", 0)) / 3.6
-    tas_ms  = float(data.get("TAS, km/h", 0)) / 3.6
-    alt_m   = float(data.get("altitude_10", data.get("altitude", 0)))
-    vvi_ms  = float(data.get("vario", 0))
-    hdg     = float(data.get("compass", 0))
-    pitch   = float(data.get("pitch", 0))
-    bank    = float(data.get("roll", 0))
-    aoa     = float(data.get("AoA, deg", 0))
-    g_load  = float(data.get("Ny", 1.0))
+    ias_ms   = float(data.get("IAS, km/h", 0)) / 3.6
+    tas_ms   = float(data.get("TAS, km/h", 0)) / 3.6
+    alt_m    = float(data.get("altitude_10", data.get("altitude", 0)))
+    vvi_ms   = float(data.get("vario", 0))
+    hdg      = float(data.get("compass", 0))
+    pitch    = float(data.get("pitch", 0))
+    bank     = float(data.get("roll", 0))
+    aoa      = float(data.get("AoA, deg", 0))
+    g_load   = float(data.get("Ny", 1.0))
     throttle = float(data.get("throttle_1", 0))
-    rpm_1   = float(data.get("rpm_throttle_1", 0)) * 100
-    rpm_2   = float(data.get("rpm_throttle_2", 0)) * 100
-    fuel    = float(data.get("fuel_kg", data.get("Mfuel", 0)))
+    rpm_1    = float(data.get("rpm_throttle_1", 0)) * 100
+    rpm_2    = float(data.get("rpm_throttle_2", 0)) * 100
+    fuel     = float(data.get("fuel_kg", data.get("Mfuel", 0)))
 
     return AircraftState(
         timestamp=time.time(),
@@ -229,7 +259,6 @@ async def poll_warthunder():
         connector=aiohttp.TCPConnector(limit=4)
     ) as session:
 
-        # Fetch map info once to calibrate coordinates
         try:
             async with session.get(URL_MAP_INFO) as r:
                 if r.status == 200:
@@ -249,16 +278,15 @@ async def poll_warthunder():
             t0 = time.time()
             shared.poll_count += 1
 
-            # --- fetch map_obj first to get player position ---
             raw_objs: list = []
             try:
                 async with session.get(URL_MAP_OBJ) as r:
                     if r.status == 200:
                         raw_objs = await r.json(content_type=None)
+                        shared.raw_map_obj = raw_objs   # store for /debug/map_obj
             except Exception:
                 pass
 
-            # Extract player lat/lon from the Player marker in map_obj
             player_pos = _extract_player_pos(raw_objs)
             if player_pos:
                 player_lat, player_lon = player_pos
@@ -268,7 +296,6 @@ async def poll_warthunder():
             else:
                 player_lat, player_lon = 0.0, 0.0
 
-            # --- fetch /state and inject lat/lon from map_obj ---
             try:
                 async with session.get(URL_STATE) as r:
                     if r.status == 200:
@@ -280,7 +307,6 @@ async def poll_warthunder():
             except Exception:
                 shared.wt_connected = False
 
-            # --- ingest contacts using confirmed player position ---
             if raw_objs:
                 _ingest_contacts(raw_objs, player_lat, player_lon)
 
