@@ -109,21 +109,25 @@ def _icon_to_category(icon: str) -> str:
 
 # ----------------------------------------------------------------
 # Sliding-window speed estimator (N=5 samples)
+# Returns None on the first frame (no previous position yet).
 # ----------------------------------------------------------------
 SPEED_WINDOW = 5
 
 _speed_windows: dict[str, deque] = {}
 _prev_positions: dict[str, tuple[float, float, float]] = {}
 
-_MIN_SPEED_KMH = 300.0
+# Set to 0.0 to show all contacts (debug mode).
+# Raise to e.g. 300.0 once you've confirmed contacts appear.
+_MIN_SPEED_KMH = 0.0
 
 
-def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
+def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float | None:
+    """Returns None on first observation (no delta yet)."""
     prev = _prev_positions.get(uid)
     if prev is None:
         _prev_positions[uid] = (lat, lon, now)
         _speed_windows.setdefault(uid, deque(maxlen=SPEED_WINDOW))
-        return 0.0
+        return None  # first frame — caller decides what to do
 
     p_lat, p_lon, p_ts = prev
     dt = now - p_ts
@@ -140,9 +144,11 @@ def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
 # ----------------------------------------------------------------
 # Contacts ingestion
 # Rules:
-#   - Any category (Air, Ground, Naval) — speed is the only gate
 #   - Enemies (coalition == 2) and neutrals (coalition == 0) only
-#   - Speed > 300 km/h
+#   - First-frame contacts are admitted with speed=0 so their
+#     position history starts accumulating immediately.
+#   - From the second frame onward, speed gate applies
+#     (_MIN_SPEED_KMH — set to 0.0 to disable).
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
@@ -173,14 +179,18 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
 
             uid = str(obj.get("id", f"{ox:.4f}_{oy:.4f}"))
 
-            speed_ms  = _smoothed_speed_ms(uid, lat, lon, now)
-            speed_kmh = speed_ms * 3.6
+            speed_result = _smoothed_speed_ms(uid, lat, lon, now)
+
+            if speed_result is None:
+                # First frame — admit the contact with speed=0 so history builds
+                speed_ms = 0.0
+            else:
+                speed_ms = speed_result
+                # Apply speed gate only from the second frame onward
+                if _MIN_SPEED_KMH > 0 and speed_ms * 3.6 < _MIN_SPEED_KMH:
+                    continue
+
             speed_kts = speed_ms * 1.94384
-
-            # Speed filter — the only gate
-            if speed_kmh < _MIN_SPEED_KMH:
-                continue
-
             category = _icon_to_category(icon)
 
             contact = ContactState(
