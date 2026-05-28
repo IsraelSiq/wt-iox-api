@@ -169,6 +169,26 @@ async def get_contacts():
 
 
 # ----------------------------------------------------------------
+# Debug endpoint — raw category/type inspection
+# ----------------------------------------------------------------
+@app.get("/debug/raw_contacts", tags=["Debug"])
+async def debug_raw_contacts():
+    """Returns raw 'type' and 'category' fields for each contact.
+    Use this in-mission to see exactly what strings WT sends,
+    so the radar category filter can be tuned accordingly."""
+    return [
+        {
+            "id":       c.id,
+            "name":     c.name,
+            "type":     c.type,
+            "category": c.category,
+            "coalition": c.coalition,
+        }
+        for c in shared.contacts.values()
+    ]
+
+
+# ----------------------------------------------------------------
 # Logs view
 # ----------------------------------------------------------------
 @app.get("/logs/view", response_class=HTMLResponse, tags=["System"], include_in_schema=False)
@@ -413,7 +433,7 @@ function setWsStatus(status){
   else{dot.classList.add('error');lbl.textContent='OFFLINE';lbl.style.color='var(--red)';$('offline').classList.add('show');}
 }
 function initWS(){
-  clearTimeout(reconnectTimer);if(ws){try{ws.close();}catch(e){}ws=null;}
+  clearTimeout(reconnectTimer);if(ws){try{ws.close();}catch(e){}}ws=null;
   setWsStatus('connecting');$('offline-msg').textContent='Connecting...';
   const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/telemetry');
@@ -601,17 +621,25 @@ function toggleCat(cat){
 }
 
 function filterEnabled(category){
-  // Map contact category string to one of Air/Ground/Naval
-  // WT categories can vary; we normalise with a best-effort match
-  if(!category) return true;          // unknown category — always show
+  // Expanded mapping for all known WT /map_obj category strings
+  if(!category) return true;
   const c=category.toLowerCase();
-  if(c.includes('air') || c.includes('plane') || c.includes('helicopter') || c.includes('heli'))
+  // Air: aviation, plane, fighter, bomber, attacker, helicopter, heli, air
+  if(c.includes('air') || c.includes('avia') || c.includes('plane') ||
+     c.includes('fighter') || c.includes('bomber') || c.includes('attack') ||
+     c.includes('helicopter') || c.includes('heli'))
     return catFilters['Air'];
-  if(c.includes('ground') || c.includes('tank') || c.includes('vehicle') || c.includes('spaa') || c.includes('aaa'))
+  // Ground: ground, tank, vehicle, spaa, aaa, artillery, armored, wheeled, truck
+  if(c.includes('ground') || c.includes('tank') || c.includes('vehicle') ||
+     c.includes('spaa') || c.includes('aaa') || c.includes('artillery') ||
+     c.includes('armored') || c.includes('wheeled') || c.includes('truck'))
     return catFilters['Ground'];
-  if(c.includes('naval') || c.includes('ship') || c.includes('boat') || c.includes('destroyer') || c.includes('cruiser'))
+  // Naval: naval, ship, boat, destroyer, cruiser, frigate, submarine, barge
+  if(c.includes('naval') || c.includes('ship') || c.includes('boat') ||
+     c.includes('destroyer') || c.includes('cruiser') || c.includes('frigate') ||
+     c.includes('submarine') || c.includes('barge'))
     return catFilters['Naval'];
-  return true; // unrecognised — show by default
+  return true; // unrecognised — always show so nothing gets silently hidden
 }
 
 const trails={};const TRAIL_MAX=8,TRAIL_TTL=15000;
@@ -703,7 +731,7 @@ function updateSidebar(){
   const list=document.getElementById('contact-list');
   if(!n){list.innerHTML='<div style="color:var(--muted);font-size:11px;padding:8px 0;text-align:center">No contacts</div>';return;}
   const sorted=[...visible].sort((a,b)=>a.dist_m-b.dist_m);
-  list.innerHTML=sorted.map(c=>{const color=iffColor(c.coalition);const dist=c.dist_m>=1000?(c.dist_m/1000).toFixed(1)+'km':Math.round(c.dist_m)+'m';const alt=Math.round(c.alt_msl_m||0);const isThreat=c.coalition===2&&c.dist_m<20000;return'<div class="contact-row'+(c.id===selectedId?' selected':'')+(isThreat?' threat':'')+'" onclick="selectContact(\'' + c.id + '\')"><div class="iff-dot" style="background:'+color+'"></div><div class="contact-name">'+(c.name||c.id)+'</div><div class="contact-dist">'+dist+'</div><div class="contact-alt">'+alt+'m</div></div>';}).join('');
+  list.innerHTML=sorted.map(c=>{const color=iffColor(c.coalition);const dist=c.dist_m>=1000?(c.dist_m/1000).toFixed(1)+'km':Math.round(c.dist_m)+'m';const alt=Math.round(c.alt_msl_m||0);const isThreat=c.coalition===2&&c.dist_m<20000;return'<div class="contact-row'+(c.id===selectedId?' selected':'')+(isThreat?' threat':'')+'\" onclick="selectContact(\''+c.id+'\')"><div class="iff-dot" style="background:'+color+'"></div><div class="contact-name">'+(c.name||c.id)+'</div><div class="contact-dist">'+dist+'</div><div class="contact-alt">'+alt+'m</div></div>';}).join('');
 }
 function selectContact(id){
   selectedId=selectedId===id?null:id;
