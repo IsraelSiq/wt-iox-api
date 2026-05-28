@@ -143,12 +143,9 @@ def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float | 
 
 # ----------------------------------------------------------------
 # Contacts ingestion
-# Rules:
-#   - Enemies (coalition == 2) and neutrals (coalition == 0) only
-#   - First-frame contacts are admitted with speed=0 so their
-#     position history starts accumulating immediately.
-#   - From the second frame onward, speed gate applies
-#     (_MIN_SPEED_KMH — set to 0.0 to disable).
+# Shows ALL contacts: allies (1), enemies (2), neutrals (0).
+# Only skips Player marker and Waypoints.
+# Speed gate disabled (_MIN_SPEED_KMH = 0.0) for debug.
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
@@ -162,10 +159,6 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
 
             coalition_str = obj.get("color", "neutral").lower()
             coalition = {"blue": 1, "allies": 1, "red": 2, "enemies": 2}.get(coalition_str, 0)
-
-            # Skip allies
-            if coalition == 1:
-                continue
 
             ox = obj.get("x", 0.0)
             oy = obj.get("y", 0.0)
@@ -182,7 +175,7 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             speed_result = _smoothed_speed_ms(uid, lat, lon, now)
 
             if speed_result is None:
-                # First frame — admit the contact with speed=0 so history builds
+                # First frame — admit contact with speed=0 so history builds
                 speed_ms = 0.0
             else:
                 speed_ms = speed_result
