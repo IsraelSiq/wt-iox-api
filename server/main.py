@@ -112,46 +112,26 @@ def _icon_to_category(icon: str) -> str:
 
 
 # ----------------------------------------------------------------
-# Sliding-window speed estimator
-#
-# For each contact uid we keep a deque of the last SPEED_WINDOW
-# instantaneous speed samples (m/s). The reported speed is the
-# mean of all samples in the window, which smooths out the noise
-# caused by low map_obj.json position resolution at high poll rates.
-#
-# SPEED_WINDOW = 5  →  ~500 ms of history at 10 Hz
-#                       smoother than a single-sample delta while
-#                       still reacting to real speed changes within ~1 s
+# Sliding-window speed estimator (N=5 samples)
 # ----------------------------------------------------------------
-SPEED_WINDOW = 5  # number of samples to average
+SPEED_WINDOW = 5
 
-# uid -> deque of (speed_ms,) samples
 _speed_windows: dict[str, deque] = {}
-# uid -> (lat, lon, ts) — last known position for delta calculation
 _prev_positions: dict[str, tuple[float, float, float]] = {}
 
 _MIN_SPEED_KMH = 300.0
 
 
 def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
-    """
-    Compute instantaneous speed from position delta, push into the
-    sliding window for this uid, and return the windowed mean.
-    """
     prev = _prev_positions.get(uid)
     if prev is None:
         _prev_positions[uid] = (lat, lon, now)
-        # No sample yet — initialise empty window
         _speed_windows.setdefault(uid, deque(maxlen=SPEED_WINDOW))
         return 0.0
 
     p_lat, p_lon, p_ts = prev
     dt = now - p_ts
-    if dt > 0:
-        dist_m   = haversine(p_lat, p_lon, lat, lon)
-        instant  = dist_m / dt
-    else:
-        instant = 0.0
+    instant = haversine(p_lat, p_lon, lat, lon) / dt if dt > 0 else 0.0
 
     _prev_positions[uid] = (lat, lon, now)
 
@@ -162,7 +142,11 @@ def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
 
 
 # ----------------------------------------------------------------
-# Contacts ingestion — Air only, speed > 300 km/h
+# Contacts ingestion
+# Rules:
+#   - Air category only
+#   - Enemies (coalition == 2) and neutrals (coalition == 0) only
+#   - Speed > 300 km/h
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
@@ -174,16 +158,21 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             if icon in ("Player", "Waypoint"):
                 continue
 
+            # Air-only
             category = _icon_to_category(icon)
             if category != "Air":
+                continue
+
+            coalition_str = obj.get("color", "neutral").lower()
+            coalition = {"blue": 1, "allies": 1, "red": 2, "enemies": 2}.get(coalition_str, 0)
+
+            # Skip allies (coalition == 1)
+            if coalition == 1:
                 continue
 
             ox = obj.get("x", 0.0)
             oy = obj.get("y", 0.0)
             lat, lon = xy_to_latlon(ox, oy)
-
-            coalition_str = obj.get("color", "neutral").lower()
-            coalition = {"blue": 1, "allies": 1, "red": 2, "enemies": 2}.get(coalition_str, 0)
 
             hdg = float(obj.get("dx", 0.0))
             ddy = float(obj.get("dy", 0.0))
@@ -197,6 +186,7 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             speed_kmh = speed_ms * 3.6
             speed_kts = speed_ms * 1.94384
 
+            # Speed filter
             if speed_kmh < _MIN_SPEED_KMH:
                 continue
 
