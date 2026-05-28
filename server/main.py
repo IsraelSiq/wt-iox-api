@@ -45,10 +45,10 @@ _map_size_m: float = 65536.0
 # ----------------------------------------------------------------
 # Coordinate conversion
 # ----------------------------------------------------------------
-_map_x_min: float = 0.0
-_map_x_max: float = 65536.0
-_map_y_min: float = 0.0
-_map_y_max: float = 65536.0
+_map_x_min: float = -32768.0
+_map_x_max: float =  32768.0
+_map_y_min: float = -32768.0
+_map_y_max: float =  32768.0
 
 MAP_CENTERS = {
     "avg_war":  (50.0,  30.0),
@@ -80,11 +80,36 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 
 
 # ----------------------------------------------------------------
+# Coalition detection — WT returns hex color strings, NOT text labels.
+# Source: https://github.com/lucasvmx/WarThunder-localhost-documentation
+#
+#   #185AFF / #145CFF  →  coalition 1 (allies / blue team)
+#   #fa3200 / #f01e00  →  coalition 2 (enemies / red team)
+#   #24D921            →  coalition 1 (own player marker, green)
+#   anything else      →  coalition 0 (neutral / unknown)
+# ----------------------------------------------------------------
+_COALITION_MAP: dict[str, int] = {
+    "#185aff": 1,
+    "#145cff": 1,
+    "#4d7aff": 1,  # alternate blue shade observed in some modes
+    "#24d921": 1,  # own player (green) — same team
+    "#fa3200": 2,
+    "#f01e00": 2,
+    "#ff3200": 2,  # alternate red shade
+}
+
+
+def _color_to_coalition(color_hex: str) -> int:
+    return _COALITION_MAP.get(color_hex.lower().strip(), 0)
+
+
+# ----------------------------------------------------------------
 # Icon -> Category mapping
 # ----------------------------------------------------------------
 _AIR_ICONS = {
     "aircraft", "fighter", "bomber", "attacker", "aviation",
     "helicopter", "heli", "plane", "jet", "torpedo_bomber",
+    "assault",  # WT uses "Assault" for attack aircraft
 }
 _NAVAL_ICONS = {
     "ship", "destroyer", "cruiser", "carrier", "boat",
@@ -151,26 +176,40 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
     now = time.time()
 
-    for obj in raw_objects:
+    for i, obj in enumerate(raw_objects):
         try:
             icon = obj.get("icon", "")
             if icon in ("Player", "Waypoint"):
                 continue
 
-            coalition_str = obj.get("color", "neutral").lower()
-            coalition = {"blue": 1, "allies": 1, "red": 2, "enemies": 2}.get(coalition_str, 0)
+            # --- fix #3: coalition from hex color, not text label ---
+            coalition = _color_to_coalition(obj.get("color", ""))
 
             ox = obj.get("x", 0.0)
             oy = obj.get("y", 0.0)
             lat, lon = xy_to_latlon(ox, oy)
 
-            hdg = float(obj.get("dx", 0.0))
-            ddy = float(obj.get("dy", 0.0))
-            heading_deg = math.degrees(math.atan2(hdg, ddy)) % 360
+            # --- fix #4: heading — WT Y-axis grows downward, so negate dy ---
+            # dx = cos(V),  dy = sin(V)  where V is the heading angle
+            # Geographic heading (N=0°, clockwise): atan2(dx, -dy)
+            dx = float(obj.get("dx", 0.0))
+            dy = float(obj.get("dy", 0.0))
+            heading_deg = math.degrees(math.atan2(dx, -dy)) % 360
 
             dist_m = haversine(player_lat, player_lon, lat, lon) if (player_lat or player_lon) else 0.0
 
-            uid = str(obj.get("id", f"{ox:.4f}_{oy:.4f}"))
+            # --- fix #6: stable UID using type+color+index, NOT position ---
+            # WT does not send an "id" field in map_obj.json. Using position
+            # (x, y) as key caused the UID to change every frame because the
+            # object moves, so _prev_positions never accumulated history and
+            # speed was always 0.0. type+color+index is stable within a frame.
+            obj_id = obj.get("id")
+            if obj_id is not None:
+                uid = str(obj_id)
+            else:
+                obj_type  = obj.get("type", "?")
+                obj_color = obj.get("color", "?")
+                uid = f"{obj_type}_{obj_color}_{i}"
 
             speed_result = _smoothed_speed_ms(uid, lat, lon, now)
 
@@ -313,14 +352,15 @@ async def poll_warthunder():
             async with session.get(URL_MAP_INFO) as r:
                 if r.status == 200:
                     info = await r.json(content_type=None)
-                    _map_x_min = float(info.get("map_min", [0, 0])[0])
-                    _map_y_min = float(info.get("map_min", [0, 0])[1])
-                    _map_x_max = float(info.get("map_max", [65536, 65536])[0])
-                    _map_y_max = float(info.get("map_max", [65536, 65536])[1])
+                    # map_min / map_max are lists of strings in the WT API, e.g. ["-32768.0", "-32768.0"]
+                    _map_x_min = float(info.get("map_min", ["-32768.0", "-32768.0"])[0])
+                    _map_y_min = float(info.get("map_min", ["-32768.0", "-32768.0"])[1])
+                    _map_x_max = float(info.get("map_max", ["32768.0",  "32768.0"])[0])
+                    _map_y_max = float(info.get("map_max", ["32768.0",  "32768.0"])[1])
                     map_name   = info.get("map_name", "").lower()
                     center     = MAP_CENTERS.get(map_name, DEFAULT_CENTER)
                     _anchor_lat, _anchor_lon = center
-                    log.info(f"[wt-iox] Map: {map_name}  bounds: {_map_x_min:.0f}-{_map_x_max:.0f} x {_map_y_min:.0f}-{_map_y_max:.0f}")
+                    log.info(f"[wt-iox] Map: {map_name}  bounds: X[{_map_x_min:.0f}, {_map_x_max:.0f}]  Y[{_map_y_min:.0f}, {_map_y_max:.0f}]")
         except Exception as e:
             log.warning(f"[wt-iox] Could not fetch map_info: {e}")
 
