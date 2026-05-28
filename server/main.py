@@ -122,14 +122,47 @@ def _icon_to_category(icon: str) -> str:
 
 
 # ----------------------------------------------------------------
+# Speed estimation via position delta between polls
+# Stores last known (lat, lon, timestamp) per contact uid
+# ----------------------------------------------------------------
+_prev_positions: dict[str, tuple[float, float, float]] = {}  # uid -> (lat, lon, ts)
+
+_MIN_SPEED_KMH = 300.0  # only contacts faster than this are kept
+
+
+def _estimate_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
+    """Return estimated ground speed in m/s using haversine delta from last poll."""
+    prev = _prev_positions.get(uid)
+    if prev is None:
+        _prev_positions[uid] = (lat, lon, now)
+        return 0.0
+    p_lat, p_lon, p_ts = prev
+    dt = now - p_ts
+    if dt <= 0:
+        return 0.0
+    dist_m = haversine(p_lat, p_lon, lat, lon)
+    speed_ms = dist_m / dt
+    _prev_positions[uid] = (lat, lon, now)
+    return speed_ms
+
+
+# ----------------------------------------------------------------
 # Contacts ingestion
+# Only Air contacts moving faster than _MIN_SPEED_KMH are kept.
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
+    now = time.time()
+
     for obj in raw_objects:
         try:
             icon = obj.get("icon", "")
             if icon in ("Player", "Waypoint"):
+                continue
+
+            # --- Air-only filter ---
+            category = _icon_to_category(icon)
+            if category != "Air":
                 continue
 
             ox = obj.get("x", 0.0)
@@ -143,11 +176,19 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             ddy = float(obj.get("dy", 0.0))
             heading_deg = math.degrees(math.atan2(hdg, ddy)) % 360
 
-            category = _icon_to_category(icon)
-
             dist_m = haversine(player_lat, player_lon, lat, lon) if (player_lat or player_lon) else 0.0
 
             uid = str(obj.get("id", f"{ox:.4f}_{oy:.4f}"))
+
+            # --- Speed estimation ---
+            speed_ms  = _estimate_speed_ms(uid, lat, lon, now)
+            speed_kmh = speed_ms * 3.6
+            speed_kts = speed_ms * 1.94384
+
+            # --- Speed filter: skip contacts below threshold ---
+            if speed_kmh < _MIN_SPEED_KMH:
+                continue
+
             contact = ContactState(
                 id=uid,
                 name=obj.get("btype", obj.get("type", "unknown")),
@@ -157,14 +198,20 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
                 lon=lon,
                 alt_msl_m=float(obj.get("alt", 0)) * 0.3048,
                 heading_deg=heading_deg,
-                speed_ms=0.0,
-                speed_kts=0.0,
+                speed_ms=round(speed_ms, 2),
+                speed_kts=round(speed_kts, 1),
                 coalition=coalition,
                 dist_m=dist_m,
             )
             new_contacts[uid] = contact
         except Exception as e:
             log.debug(f"[contacts] parse error: {e} | {obj}")
+
+    # Clean up stale entries from _prev_positions to avoid unbounded growth
+    active_uids = set(new_contacts.keys())
+    stale = [k for k in _prev_positions if k not in active_uids and (now - _prev_positions[k][2]) > 30]
+    for k in stale:
+        del _prev_positions[k]
 
     shared.contacts = new_contacts
     shared.contacts_timestamp = time.time()
@@ -184,6 +231,8 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
                 "lon":         round(c.lon, 5),
                 "alt_msl_m":   round(c.alt_msl_m, 1),
                 "heading_deg": round(c.heading_deg, 1),
+                "speed_kmh":   round(c.speed_ms * 3.6, 1),
+                "speed_kts":   round(c.speed_kts, 1),
                 "dist_m":      round(c.dist_m, 0),
             }
             for c in new_contacts.values()
