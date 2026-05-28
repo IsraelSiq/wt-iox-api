@@ -86,10 +86,6 @@ _AIR_ICONS = {
     "aircraft", "fighter", "bomber", "attacker", "aviation",
     "helicopter", "heli", "plane", "jet", "torpedo_bomber",
 }
-_GROUND_ICONS = {
-    "tank", "car", "truck", "spaa", "aaa", "artillery",
-    "armoured", "vehicle", "ground", "air_defence",
-}
 _NAVAL_ICONS = {
     "ship", "destroyer", "cruiser", "carrier", "boat",
     "naval", "frigate", "submarine",
@@ -144,7 +140,7 @@ def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float:
 # ----------------------------------------------------------------
 # Contacts ingestion
 # Rules:
-#   - Air category only
+#   - Any category (Air, Ground, Naval) — speed is the only gate
 #   - Enemies (coalition == 2) and neutrals (coalition == 0) only
 #   - Speed > 300 km/h
 # ----------------------------------------------------------------
@@ -158,15 +154,10 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             if icon in ("Player", "Waypoint"):
                 continue
 
-            # Air-only
-            category = _icon_to_category(icon)
-            if category != "Air":
-                continue
-
             coalition_str = obj.get("color", "neutral").lower()
             coalition = {"blue": 1, "allies": 1, "red": 2, "enemies": 2}.get(coalition_str, 0)
 
-            # Skip allies (coalition == 1)
+            # Skip allies
             if coalition == 1:
                 continue
 
@@ -186,9 +177,11 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             speed_kmh = speed_ms * 3.6
             speed_kts = speed_ms * 1.94384
 
-            # Speed filter
+            # Speed filter — the only gate
             if speed_kmh < _MIN_SPEED_KMH:
                 continue
+
+            category = _icon_to_category(icon)
 
             contact = ContactState(
                 id=uid,
