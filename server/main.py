@@ -40,6 +40,9 @@ URL_STATE     = f"{WT_BASE}/state"
 URL_MAP_OBJ   = f"{WT_BASE}/map_obj.json"
 URL_MAP_INFO  = f"{WT_BASE}/map_info.json"
 
+# Expose WT base URL to api.py (used by /map/image proxy)
+shared.wt_base = WT_BASE
+
 _map_size_m: float = 65536.0
 
 # ----------------------------------------------------------------
@@ -80,22 +83,16 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 
 
 # ----------------------------------------------------------------
-# Coalition detection — WT returns hex color strings, NOT text labels.
-# Source: https://github.com/lucasvmx/WarThunder-localhost-documentation
-#
-#   #185AFF / #145CFF  →  coalition 1 (allies / blue team)
-#   #fa3200 / #f01e00  →  coalition 2 (enemies / red team)
-#   #24D921            →  coalition 1 (own player marker, green)
-#   anything else      →  coalition 0 (neutral / unknown)
+# Coalition detection
 # ----------------------------------------------------------------
 _COALITION_MAP: dict[str, int] = {
     "#185aff": 1,
     "#145cff": 1,
-    "#4d7aff": 1,  # alternate blue shade observed in some modes
-    "#24d921": 1,  # own player (green) — same team
+    "#4d7aff": 1,
+    "#24d921": 1,
     "#fa3200": 2,
     "#f01e00": 2,
-    "#ff3200": 2,  # alternate red shade
+    "#ff3200": 2,
 }
 
 
@@ -109,11 +106,16 @@ def _color_to_coalition(color_hex: str) -> int:
 _AIR_ICONS = {
     "aircraft", "fighter", "bomber", "attacker", "aviation",
     "helicopter", "heli", "plane", "jet", "torpedo_bomber",
-    "assault",  # WT uses "Assault" for attack aircraft
+    "assault",
 }
 _NAVAL_ICONS = {
     "ship", "destroyer", "cruiser", "carrier", "boat",
     "naval", "frigate", "submarine",
+}
+_STATIC_ICONS = {
+    "airfield", "airbase", "spawn", "spawnpoint", "base",
+    "capture_zone", "capture", "zone", "objective",
+    "airdrome",
 }
 
 
@@ -123,26 +125,28 @@ def _icon_to_category(icon: str) -> str:
         return "Air"
     if key in _NAVAL_ICONS:
         return "Naval"
+    if key in _STATIC_ICONS:
+        return "Static"
     for air in _AIR_ICONS:
         if air in key:
             return "Air"
     for nav in _NAVAL_ICONS:
         if nav in key:
             return "Naval"
+    for st in _STATIC_ICONS:
+        if st in key:
+            return "Static"
     return "Ground"
 
 
 # ----------------------------------------------------------------
 # Sliding-window speed estimator (N=5 samples)
-# Returns None on the first frame (no previous position yet).
 # ----------------------------------------------------------------
 SPEED_WINDOW = 5
 
 _speed_windows: dict[str, deque] = {}
 _prev_positions: dict[str, tuple[float, float, float]] = {}
 
-# Set to 0.0 to show all contacts (debug mode).
-# Raise to e.g. 300.0 once you've confirmed contacts appear.
 _MIN_SPEED_KMH = 0.0
 
 
@@ -152,7 +156,7 @@ def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float | 
     if prev is None:
         _prev_positions[uid] = (lat, lon, now)
         _speed_windows.setdefault(uid, deque(maxlen=SPEED_WINDOW))
-        return None  # first frame — caller decides what to do
+        return None
 
     p_lat, p_lon, p_ts = prev
     dt = now - p_ts
@@ -168,12 +172,10 @@ def _smoothed_speed_ms(uid: str, lat: float, lon: float, now: float) -> float | 
 
 # ----------------------------------------------------------------
 # Contacts ingestion
-# Shows ALL contacts: allies (1), enemies (2), neutrals (0).
-# Only skips Player marker and Waypoints.
-# Speed gate disabled (_MIN_SPEED_KMH = 0.0) for debug.
 # ----------------------------------------------------------------
 def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
     new_contacts: dict = {}
+    new_statics: list = []
     now = time.time()
 
     for i, obj in enumerate(raw_objects):
@@ -182,27 +184,18 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
             if icon in ("Player", "Waypoint"):
                 continue
 
-            # --- fix #3: coalition from hex color, not text label ---
             coalition = _color_to_coalition(obj.get("color", ""))
 
             ox = obj.get("x", 0.0)
             oy = obj.get("y", 0.0)
             lat, lon = xy_to_latlon(ox, oy)
 
-            # --- fix #4: heading — WT Y-axis grows downward, so negate dy ---
-            # dx = cos(V),  dy = sin(V)  where V is the heading angle
-            # Geographic heading (N=0°, clockwise): atan2(dx, -dy)
             dx = float(obj.get("dx", 0.0))
             dy = float(obj.get("dy", 0.0))
             heading_deg = math.degrees(math.atan2(dx, -dy)) % 360
 
             dist_m = haversine(player_lat, player_lon, lat, lon) if (player_lat or player_lon) else 0.0
 
-            # --- fix #6: stable UID using type+color+index, NOT position ---
-            # WT does not send an "id" field in map_obj.json. Using position
-            # (x, y) as key caused the UID to change every frame because the
-            # object moves, so _prev_positions never accumulated history and
-            # speed was always 0.0. type+color+index is stable within a frame.
             obj_id = obj.get("id")
             if obj_id is not None:
                 uid = str(obj_id)
@@ -211,19 +204,33 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
                 obj_color = obj.get("color", "?")
                 uid = f"{obj_type}_{obj_color}_{i}"
 
+            category = _icon_to_category(icon)
+
+            # --- fix #9: separate static objects from dynamic contacts ---
+            if category == "Static":
+                new_statics.append({
+                    "id":       uid,
+                    "name":     obj.get("btype", obj.get("type", "unknown")),
+                    "type":     obj.get("btype", obj.get("type", "unknown")),
+                    "icon":     icon,
+                    "coalition": coalition,
+                    "lat":      round(lat, 5),
+                    "lon":      round(lon, 5),
+                    "x_norm":   ox,
+                    "y_norm":   oy,
+                })
+                continue
+
             speed_result = _smoothed_speed_ms(uid, lat, lon, now)
 
             if speed_result is None:
-                # First frame — admit contact with speed=0 so history builds
                 speed_ms = 0.0
             else:
                 speed_ms = speed_result
-                # Apply speed gate only from the second frame onward
                 if _MIN_SPEED_KMH > 0 and speed_ms * 3.6 < _MIN_SPEED_KMH:
                     continue
 
             speed_kts = speed_ms * 1.94384
-            category = _icon_to_category(icon)
 
             contact = ContactState(
                 id=uid,
@@ -255,6 +262,7 @@ def _ingest_contacts(raw_objects: list, player_lat: float, player_lon: float):
 
     shared.contacts = new_contacts
     shared.contacts_timestamp = time.time()
+    shared.static_objects = new_statics  # fix #9
 
     entry = {
         "received_at": datetime.datetime.now().strftime("%H:%M:%S"),
@@ -335,11 +343,50 @@ def _parse_state(data: dict, lat: float = 0.0, lon: float = 0.0) -> AircraftStat
 
 
 # ----------------------------------------------------------------
+# fix #7 — map_info re-fetch helper
+# ----------------------------------------------------------------
+async def _fetch_map_info(session: aiohttp.ClientSession) -> str | None:
+    """Fetches map_info.json, updates global map bounds/anchor.
+    Returns the map_name string, or None on failure."""
+    global _map_x_min, _map_x_max, _map_y_min, _map_y_max, _anchor_lat, _anchor_lon
+    try:
+        async with session.get(URL_MAP_INFO) as r:
+            if r.status != 200:
+                return None
+            info = await r.json(content_type=None)
+            _map_x_min = float(info.get("map_min", ["-32768.0", "-32768.0"])[0])
+            _map_y_min = float(info.get("map_min", ["-32768.0", "-32768.0"])[1])
+            _map_x_max = float(info.get("map_max", ["32768.0",  "32768.0"])[0])
+            _map_y_max = float(info.get("map_max", ["32768.0",  "32768.0"])[1])
+            map_name   = info.get("map_name", "").lower()
+            center     = MAP_CENTERS.get(map_name, DEFAULT_CENTER)
+            _anchor_lat, _anchor_lon = center
+
+            # Expose current map info to api.py
+            shared.map_info = {
+                "map_name":   map_name,
+                "map_generation": info.get("map_generation"),
+                "map_min":    [_map_x_min, _map_y_min],
+                "map_max":    [_map_x_max, _map_y_max],
+                "anchor_lat": _anchor_lat,
+                "anchor_lon": _anchor_lon,
+            }
+
+            log.info(
+                f"[wt-iox] Map: {map_name}  gen={info.get('map_generation')}  "
+                f"bounds: X[{_map_x_min:.0f}, {_map_x_max:.0f}]  "
+                f"Y[{_map_y_min:.0f}, {_map_y_max:.0f}]"
+            )
+            return map_name
+    except Exception as e:
+        log.warning(f"[wt-iox] Could not fetch map_info: {e}")
+        return None
+
+
+# ----------------------------------------------------------------
 # Main poller loop
 # ----------------------------------------------------------------
 async def poll_warthunder():
-    global _map_x_min, _map_x_max, _map_y_min, _map_y_max, _anchor_lat, _anchor_lon
-
     interval = 1.0 / POLL_HZ
     log.info(f"[wt-iox] Polling {WT_BASE} at {POLL_HZ}Hz  (speed window: {SPEED_WINDOW} samples)")
 
@@ -348,25 +395,31 @@ async def poll_warthunder():
         connector=aiohttp.TCPConnector(limit=4)
     ) as session:
 
-        try:
-            async with session.get(URL_MAP_INFO) as r:
-                if r.status == 200:
-                    info = await r.json(content_type=None)
-                    # map_min / map_max are lists of strings in the WT API, e.g. ["-32768.0", "-32768.0"]
-                    _map_x_min = float(info.get("map_min", ["-32768.0", "-32768.0"])[0])
-                    _map_y_min = float(info.get("map_min", ["-32768.0", "-32768.0"])[1])
-                    _map_x_max = float(info.get("map_max", ["32768.0",  "32768.0"])[0])
-                    _map_y_max = float(info.get("map_max", ["32768.0",  "32768.0"])[1])
-                    map_name   = info.get("map_name", "").lower()
-                    center     = MAP_CENTERS.get(map_name, DEFAULT_CENTER)
-                    _anchor_lat, _anchor_lon = center
-                    log.info(f"[wt-iox] Map: {map_name}  bounds: X[{_map_x_min:.0f}, {_map_x_max:.0f}]  Y[{_map_y_min:.0f}, {_map_y_max:.0f}]")
-        except Exception as e:
-            log.warning(f"[wt-iox] Could not fetch map_info: {e}")
+        # Initial map_info fetch
+        await _fetch_map_info(session)
+        last_generation = (shared.map_info or {}).get("map_generation")
 
         while True:
             t0 = time.time()
             shared.poll_count += 1
+
+            # fix #7: re-fetch map_info when map_generation changes
+            try:
+                async with session.get(URL_MAP_INFO) as r:
+                    if r.status == 200:
+                        info_check = await r.json(content_type=None)
+                        cur_gen = info_check.get("map_generation")
+                        if cur_gen != last_generation:
+                            log.info(f"[wt-iox] map_generation changed {last_generation} -> {cur_gen}, re-fetching map_info")
+                            await _fetch_map_info(session)
+                            last_generation = cur_gen
+                            # Clear stale tracking data on map change
+                            _prev_positions.clear()
+                            _speed_windows.clear()
+                            shared.contacts.clear()
+                            shared.static_objects = []
+            except Exception:
+                pass
 
             raw_objs: list = []
             try:

@@ -1,18 +1,17 @@
 # server/state.py
-# Shared in-process state
-import time
+# Shared mutable state — imported by both main.py and api.py
 from collections import deque
-from typing import Optional, Dict, List
 from server.models import AircraftState, ContactState
 
-start_time: float = time.time()
-latest_state: Optional[AircraftState] = None
-contacts: Dict[str, ContactState] = {}
+latest_state:       AircraftState | None = None
+contacts:           dict[str, ContactState] = {}
 contacts_timestamp: float = 0.0
-poll_count: int = 0
-wt_connected: bool = False
-log_buffer: deque = deque(maxlen=200)
-contacts_log: deque = deque(maxlen=500)
-
-# Raw map_obj data from WT (last poll) — used by /debug/map_obj
-raw_map_obj: List[dict] = []
+contacts_log:       deque  = deque(maxlen=500)
+raw_map_obj:        list   = []
+static_objects:     list   = []   # fix #9 — airfields, spawn points, zones
+map_info:           dict | None = None   # fix #7 — current map metadata
+wt_base:            str    = "http://127.0.0.1:8111"   # fix #8 — WT host for proxy
+wt_connected:       bool   = False
+start_time:         float  = 0.0
+poll_count:         int    = 0
+log_buffer:         deque  = deque(maxlen=500)
